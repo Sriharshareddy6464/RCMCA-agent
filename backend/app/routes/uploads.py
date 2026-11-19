@@ -1,14 +1,30 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 router = APIRouter(prefix="/api/v1/uploads", tags=["uploads"])
 _CONTENT_TYPES = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+
+# Local (non-S3) demo storage. main.py serves this directory at /uploads.
+UPLOAD_DIR = Path(
+    os.getenv("UPLOAD_DIR") or Path(__file__).resolve().parents[3] / "uploads"
+)
+MAX_LOCAL_FILES = 4
+MAX_LOCAL_BYTES = 8 * 1024 * 1024
+
+
+def _looks_like(extension: str, head: bytes) -> bool:
+    if extension == "jpg":
+        return head.startswith(b"\xff\xd8\xff")
+    if extension == "png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    return head[:4] == b"RIFF" and head[8:12] == b"WEBP"
 
 
 class PresignRequest(BaseModel):
@@ -53,3 +69,40 @@ async def presign_upload(payload: PresignRequest):
         "evidence_image_url": f"{cdn_base}/{key}",
         "expires_in_seconds": 300,
     }
+
+
+@router.post("/local")
+async def upload_local(request: Request, files: list[UploadFile] = File(...)):
+    """Store up to 4 demo photos on local disk so uploads work without S3."""
+    if not files:
+        raise HTTPException(status_code=422, detail="Attach at least one image")
+    if len(files) > MAX_LOCAL_FILES:
+        raise HTTPException(
+            status_code=413, detail=f"Upload at most {MAX_LOCAL_FILES} images at a time"
+        )
+
+    # Validate everything before writing anything, so a bad file leaves no orphans.
+    staged: list[tuple[str, bytes]] = []
+    for upload in files:
+        extension = _CONTENT_TYPES.get((upload.content_type or "").lower())
+        if extension is None:
+            raise HTTPException(status_code=415, detail="Upload JPEG, PNG, or WebP images")
+        data = await upload.read(MAX_LOCAL_BYTES + 1)
+        if len(data) > MAX_LOCAL_BYTES:
+            raise HTTPException(
+                status_code=413, detail=f"Each image must be under {MAX_LOCAL_BYTES // (1024 * 1024)} MB"
+            )
+        if not _looks_like(extension, data[:12]):
+            raise HTTPException(status_code=415, detail="File content does not match its image type")
+        staged.append((f"{uuid4().hex}.{extension}", data))
+
+    def write_all() -> None:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        for name, data in staged:
+            (UPLOAD_DIR / name).write_bytes(data)
+
+    await run_in_threadpool(write_all)
+
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/") or str(request.base_url).rstrip("/")
+    urls = [f"{base}/uploads/{name}" for name, _ in staged]
+    return {"image_urls": urls, "count": len(urls)}
