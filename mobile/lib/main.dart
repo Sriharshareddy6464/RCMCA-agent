@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:camera/camera.dart';
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
@@ -76,13 +76,17 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   Position? _position;
   List<RoadHazard> _hazards = [];
   List<Symbol> _symbols = [];
+  Line? _routeLine;
   String? _error;
+  bool _navigationActive = false;
   bool _loadingHazards = false;
   bool _reloadHazardsAfterCurrent = false;
   bool _forceHazardReloadAfterCurrent = false;
   DateTime? _lastHazardRefreshAt;
   final Set<String> _promptedIssueIds = {};
   String? _userId;
+  final TextEditingController _destinationLat = TextEditingController(text: '17.4435');
+  final TextEditingController _destinationLon = TextEditingController(text: '78.3772');
 
   @override
   void initState() {
@@ -100,7 +104,73 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   @override
   void dispose() {
     _positionSubscription?.cancel();
+    _destinationLat.dispose();
+    _destinationLon.dispose();
     super.dispose();
+  }
+
+  Future<void> _startLocation() async {
+    try {
+      final enabled = await Geolocator.isLocationServiceEnabled();
+      if (!enabled) throw Exception('Turn on device location to use road alerts.');
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        throw Exception('Location permission is needed for reports and nearby alerts.');
+      }
+      if (_navigationActive && permission != LocationPermission.always) {
+        permission = await Geolocator.requestPermission();
+        if (permission != LocationPermission.always) {
+          if (mounted) {
+            await showDialog<void>(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('Allow background location'),
+                content: const Text('Allow background location to receive hazard prompts while RCMCA navigation is active and the app is not open. Without it, prompts are limited to when the app is in use. You can change this in app settings.'),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('Later')),
+                  FilledButton(onPressed: () async { await Geolocator.openAppSettings(); if (context.mounted) Navigator.pop(context); }, child: const Text('Open settings')),
+                ],
+              ),
+            );
+          }
+        }
+      }
+      final settings = Platform.isAndroid
+          ? AndroidSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 10,
+              foregroundNotificationConfig: _navigationActive
+                  ? const ForegroundNotificationConfig(
+                      notificationTitle: 'RCMCA navigation is active',
+                      notificationText: 'Checking nearby road hazards while you travel.',
+                      enableWakeLock: false,
+                      setOngoing: true,
+                    )
+                  : null,
+            )
+          : AppleSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 10,
+              activityType: ActivityType.automotiveNavigation,
+              allowBackgroundLocationUpdates: _navigationActive,
+              pauseLocationUpdatesAutomatically: true,
+            );
+      _positionSubscription?.cancel();
+      _positionSubscription = Geolocator.getPositionStream(locationSettings: settings).listen(
+        (position) {
+          if (!mounted) return;
+          setState(() => _position = position);
+          if (_map != null) _loadHazards();
+          if (_navigationActive) _checkNearbyHazards(position);
+        },
+        onError: (Object error) {
+          if (mounted) setState(() => _error = 'Location stream failed: $error');
+        },
+      );
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString().replaceFirst('Exception: ', ''));
+    }
   }
 
   Future<void> _onMapCreated(MapLibreMapController controller) async {
@@ -123,7 +193,13 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
     _loadingHazards = true;
     try {
       final visibleBounds = await map.getVisibleRegion();
-      final bounds = visibleBounds;
+      final position = _position;
+      final bounds = _navigationActive && position != null
+          ? LatLngBounds(
+              southwest: LatLng(position.latitude - 0.012, position.longitude - 0.015),
+              northeast: LatLng(position.latitude + 0.012, position.longitude + 0.015),
+            )
+          : visibleBounds;
       final uri = Uri.parse('$apiBase/api/v1/issues').replace(queryParameters: {
         'south': bounds.southwest.latitude.toString(),
         'west': bounds.southwest.longitude.toString(),
@@ -151,7 +227,7 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
       }
       _lastHazardRefreshAt = DateTime.now();
       if (mounted) setState(() { _hazards = hazards; _error = null; });
-      if (_position != null) _checkNearbyHazards(_position!);
+      if (_navigationActive && _position != null) _checkNearbyHazards(_position!);
     } catch (error) {
       if (mounted) setState(() => _error = 'Could not load road hazards: $error');
     } finally {
@@ -162,6 +238,44 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
         _forceHazardReloadAfterCurrent = false;
         unawaited(_loadHazards(force: reloadForce));
       }
+    }
+  }
+
+  Future<void> _planRoute() async {
+    try {
+      final origin = _position ?? await requestCurrentPosition(LocationAccuracy.high);
+      if (mounted) setState(() => _position = origin);
+      final response = await http.post(
+        Uri.parse('$apiBase/api/v1/routes/plan'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'origin': {'latitude': origin.latitude, 'longitude': origin.longitude},
+          'destination': {
+            'latitude': double.parse(_destinationLat.text),
+            'longitude': double.parse(_destinationLon.text),
+          },
+        }),
+      ).timeout(const Duration(seconds: 25));
+      if (response.statusCode != 200) throw Exception('Route service returned ${response.statusCode}.');
+      final result = jsonDecode(response.body) as Map<String, dynamic>;
+      final coordinates = (result['geometry']['coordinates'] as List)
+          .map((point) => LatLng((point[1] as num).toDouble(), (point[0] as num).toDouble()))
+          .toList();
+      final map = _map;
+      if (map == null || coordinates.length < 2) return;
+      if (_routeLine != null) await map.removeLine(_routeLine!);
+      _routeLine = await map.addLine(LineOptions(
+        geometry: coordinates,
+        lineColor: '#147D64',
+        lineWidth: 5,
+        lineOpacity: 0.9,
+      ));
+      setState(() => _navigationActive = true);
+      await _startLocation();
+      final distanceKm = (result['distance_m'] as num).toDouble() / 1000;
+      _message('${distanceKm.toStringAsFixed(1)} km · ${(result['hazards'] as List).length} hazards on this route${result['avoided_severe_hazards'] == true ? ' · severe hazard avoided' : ''}');
+    } catch (error) {
+      _message('Could not plan route: $error');
     }
   }
 
@@ -244,15 +358,23 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
               if (_position != null) Text('GPS ±${_position!.accuracy.toStringAsFixed(0)} m'),
             ]),
           ))),
-          Positioned(
-            right: 16,
-            bottom: 24,
-            child: FloatingActionButton.extended(
-              onPressed: _openReport,
-              icon: const Icon(Icons.camera_alt),
-              label: const Text('Report'),
-            ),
-          ),
+          Positioned(left: 16, right: 16, bottom: 18, child: Card(child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              Row(children: [
+                Expanded(child: TextField(controller: _destinationLat, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), decoration: const InputDecoration(labelText: 'Destination latitude'))),
+                const SizedBox(width: 12),
+                Expanded(child: TextField(controller: _destinationLon, keyboardType: const TextInputType.numberWithOptions(decimal: true, signed: true), decoration: const InputDecoration(labelText: 'Longitude'))),
+              ]),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(child: FilledButton.icon(onPressed: _planRoute, icon: const Icon(Icons.alt_route), label: Text(_navigationActive ? 'Refresh safer route' : 'Plan safer route'))),
+                const SizedBox(width: 10),
+                FilledButton.tonalIcon(onPressed: _openReport, icon: const Icon(Icons.camera_alt), label: const Text('Report')),
+              ]),
+              if (_navigationActive) TextButton(onPressed: () { setState(() => _navigationActive = false); _startLocation(); }, child: const Text('End navigation checks')),
+            ]),
+          ))),
         ]),
       );
 }
