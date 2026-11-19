@@ -81,6 +81,7 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
   bool _reloadHazardsAfterCurrent = false;
   bool _forceHazardReloadAfterCurrent = false;
   DateTime? _lastHazardRefreshAt;
+  final Set<String> _promptedIssueIds = {};
   String? _userId;
 
   @override
@@ -150,6 +151,7 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
       }
       _lastHazardRefreshAt = DateTime.now();
       if (mounted) setState(() { _hazards = hazards; _error = null; });
+      if (_position != null) _checkNearbyHazards(_position!);
     } catch (error) {
       if (mounted) setState(() => _error = 'Could not load road hazards: $error');
     } finally {
@@ -161,6 +163,56 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
         unawaited(_loadHazards(force: reloadForce));
       }
     }
+  }
+
+  void _checkNearbyHazards(Position position) {
+    for (final hazard in _hazards) {
+      if (_promptedIssueIds.contains(hazard.id)) continue;
+      final distance = Geolocator.distanceBetween(position.latitude, position.longitude, hazard.latitude, hazard.longitude);
+      if (distance <= 50) {
+        _promptedIssueIds.add(hazard.id);
+        _showVerification(hazard);
+        break;
+      }
+    }
+  }
+
+  Future<void> _showVerification(RoadHazard hazard) async {
+    if (!mounted) return;
+    final vote = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Road condition check'),
+        content: Text('${hazard.category.replaceAll('_', ' ')} reported nearby. Is it still damaged?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, 'RESOLVED'), child: const Text('Road fixed')),
+          FilledButton(onPressed: () => Navigator.pop(context, 'CONFIRM'), child: const Text('Still damaged')),
+        ],
+      ),
+    );
+    if (vote == null) return;
+    final userId = _userId;
+    if (userId == null) {
+      _message('Could not load your anonymous device identity. Try again.');
+      return;
+    }
+    try {
+      final response = await http.post(
+        Uri.parse('$apiBase/api/v1/issues/${hazard.id}/verify'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({'user_id': userId, 'vote_type': vote}),
+      );
+      if (response.statusCode != 200) throw Exception('Verification returned ${response.statusCode}.');
+      await _loadHazards();
+    } catch (error) {
+      _message('Could not submit verification: $error');
+    }
+  }
+
+  void _message(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _openReport() async {
