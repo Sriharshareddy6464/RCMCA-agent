@@ -2,9 +2,11 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -161,6 +163,11 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
     }
   }
 
+  Future<void> _openReport() async {
+    final issue = await Navigator.of(context).push<RoadHazard>(MaterialPageRoute(builder: (_) => const CaptureScreen()));
+    if (issue != null) await _loadHazards();
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
@@ -185,6 +192,105 @@ class _RoadMapScreenState extends State<RoadMapScreen> {
               if (_position != null) Text('GPS ±${_position!.accuracy.toStringAsFixed(0)} m'),
             ]),
           ))),
+          Positioned(
+            right: 16,
+            bottom: 24,
+            child: FloatingActionButton.extended(
+              onPressed: _openReport,
+              icon: const Icon(Icons.camera_alt),
+              label: const Text('Report'),
+            ),
+          ),
+        ]),
+      );
+}
+
+class CaptureScreen extends StatefulWidget {
+  const CaptureScreen({super.key});
+  @override
+  State<CaptureScreen> createState() => _CaptureScreenState();
+}
+
+class _CaptureScreenState extends State<CaptureScreen> {
+  CameraController? _camera;
+  bool _busy = false;
+  String? _error;
+  String _category = 'pothole';
+
+  @override
+  void initState() { super.initState(); _initializeCamera(); }
+
+  Future<void> _initializeCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final camera = cameras.firstWhere((item) => item.lensDirection == CameraLensDirection.back, orElse: () => cameras.first);
+      final controller = CameraController(camera, ResolutionPreset.high, enableAudio: false, imageFormatGroup: ImageFormatGroup.jpeg);
+      await controller.initialize();
+      if (!mounted) { await controller.dispose(); return; }
+      setState(() => _camera = controller);
+    } catch (error) { if (mounted) setState(() => _error = 'Camera unavailable: $error'); }
+  }
+
+  @override
+  void dispose() { _camera?.dispose(); super.dispose(); }
+
+  Future<void> _captureAndSend() async {
+    final camera = _camera;
+    if (camera == null || !camera.value.isInitialized || _busy) return;
+    setState(() { _busy = true; _error = null; });
+    try {
+      final location = await requestCurrentPosition(LocationAccuracy.bestForNavigation);
+      final capturedAt = DateTime.now().toUtc();
+      final picture = await camera.takePicture();
+      final file = File(picture.path);
+      final contentType = picture.path.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+      final signed = await http.post(Uri.parse('$apiBase/api/v1/uploads/presign'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({'file_name': picture.name, 'content_type': contentType}));
+      if (signed.statusCode != 200) throw Exception('Upload signing failed (${signed.statusCode}): ${signed.body}');
+      final upload = jsonDecode(signed.body) as Map<String, dynamic>;
+      final uploaded = await http.put(Uri.parse(upload['upload_url'] as String), headers: Map<String, String>.from(upload['headers'] as Map), body: await file.readAsBytes());
+      if (uploaded.statusCode < 200 || uploaded.statusCode >= 300) throw Exception('Image upload failed (${uploaded.statusCode}).');
+      final report = await http.post(Uri.parse('$apiBase/api/v1/issues/report'), headers: {'Content-Type': 'application/json'}, body: jsonEncode({
+        'category': _category,
+        'description': 'Citizen camera report: $_category. Captured ${location.timestamp.toUtc().toIso8601String()} with GPS accuracy ${location.accuracy.toStringAsFixed(1)} m.',
+        'latitude': location.latitude,
+        'longitude': location.longitude,
+        'severity': 3,
+        'evidence_image_url': upload['evidence_image_url'],
+        'capture_accuracy_m': location.accuracy,
+        'capture_heading_degrees': location.heading >= 0 && location.heading < 360 ? location.heading : null,
+        'captured_at': capturedAt.toIso8601String(),
+      }));
+      if (report.statusCode != 201) throw Exception('Report failed (${report.statusCode}): ${report.body}');
+      final issue = RoadHazard.fromJson((jsonDecode(report.body) as Map<String, dynamic>)['issue'] as Map<String, dynamic>);
+      final vision = http.MultipartRequest('POST', Uri.parse('$apiBase/api/v1/issues/${issue.id}/vision'));
+      vision.files.add(await http.MultipartFile.fromPath('image', file.path, contentType: MediaType.parse(contentType)));
+      final visionResponse = await vision.send();
+      if (visionResponse.statusCode != 202) _error = 'Report saved; vision assessment could not be queued (${visionResponse.statusCode}).';
+      if (mounted) Navigator.of(context).pop(issue);
+    } catch (error) {
+      if (mounted) setState(() => _error = error.toString());
+    } finally { if (mounted) setState(() => _busy = false); }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('Capture road issue')),
+        body: Column(children: [
+          Expanded(child: _camera?.value.isInitialized == true ? CameraPreview(_camera!) : Center(child: Text(_error ?? 'Opening camera…'))),
+          Padding(padding: const EdgeInsets.all(16), child: Column(children: [
+            DropdownButtonFormField<String>(initialValue: _category, decoration: const InputDecoration(labelText: 'Issue type'), items: const [
+              DropdownMenuItem(value: 'pothole', child: Text('Pothole')),
+              DropdownMenuItem(value: 'waterlogging', child: Text('Waterlogging')),
+              DropdownMenuItem(value: 'damaged_surface', child: Text('Damaged road surface')),
+              DropdownMenuItem(value: 'open_manhole', child: Text('Open manhole')),
+              DropdownMenuItem(value: 'broken_divider', child: Text('Broken divider')),
+            ], onChanged: (value) { if (value != null) setState(() => _category = value); }),
+            if (_error != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(_error!, style: const TextStyle(color: Colors.red))),
+            const SizedBox(height: 12),
+            SizedBox(width: double.infinity, child: FilledButton.icon(onPressed: _busy ? null : _captureAndSend, icon: const Icon(Icons.camera), label: Text(_busy ? 'Uploading and reporting…' : 'Capture and report'))),
+            const SizedBox(height: 4),
+            const Text('Location is sampled immediately before capture. Review traffic conditions before using your phone.'),
+          ])),
         ]),
       );
 }
