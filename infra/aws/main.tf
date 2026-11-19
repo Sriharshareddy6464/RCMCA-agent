@@ -265,3 +265,319 @@ resource "aws_s3_bucket_policy" "evidence_cloudfront" {
   })
 }
 
+resource "aws_ecr_repository" "app" {
+  for_each             = toset(["api", "osrm"])
+  name                 = "${local.name}/${each.key}"
+  image_tag_mutability = "IMMUTABLE"
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+  encryption_configuration {
+    encryption_type = "AES256"
+  }
+}
+resource "aws_cloudwatch_log_group" "ecs" {
+  for_each          = toset(["api", "municipal-sync", "vision-worker", "osrm"])
+  name              = "/ecs/${local.name}/${each.key}"
+  retention_in_days = 30
+}
+resource "aws_ecs_cluster" "main" {
+  name = local.name
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+}
+resource "aws_iam_role" "execution" {
+  name               = "${local.name}-ecs-execution"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+resource "aws_iam_role_policy_attachment" "execution" {
+  role       = aws_iam_role.execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+}
+resource "aws_iam_role" "task" {
+  name               = "${local.name}-ecs-task"
+  assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
+}
+data "aws_iam_policy_document" "ecs_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs-tasks.amazonaws.com"]
+    }
+  }
+}
+resource "aws_iam_role_policy" "task_s3" {
+  role = aws_iam_role.task.id
+  policy = jsonencode({
+    Version = "2012-10-17", Statement = [
+      {
+        Effect = "Allow", Action = ["s3:PutObject"], Resource = "${aws_s3_bucket.evidence.arn}/evidence/*"
+      },
+      {
+        Effect = "Allow", Action = ["s3:GetObject"], Resource = "${aws_s3_bucket.evidence.arn}/models/*"
+      },
+      {
+        Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = [aws_db_instance.main.master_user_secret[0].secret_arn]
+      },
+      {
+        Effect = "Allow", Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_lb" "api" {
+  name               = "${local.name}-api"
+  load_balancer_type = "application"
+  subnets            = aws_subnet.public[*].id
+  security_groups    = [aws_security_group.alb.id]
+}
+resource "aws_lb_target_group" "api" {
+  name        = "${local.name}-api"
+  port        = 8000
+  protocol    = "HTTP"
+  vpc_id      = aws_vpc.main.id
+  target_type = "ip"
+  health_check {
+    path                = "/health"
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+    interval            = 30
+  }
+}
+resource "aws_lb_listener" "https" {
+  count             = var.acm_certificate_arn == "" ? 0 : 1
+  load_balancer_arn = aws_lb.api.arn
+  port              = 443
+  protocol          = "HTTPS"
+  certificate_arn   = var.acm_certificate_arn
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.api.arn
+  }
+}
+
+resource "aws_ecs_task_definition" "api" {
+  family                   = "${local.name}-api"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  container_definitions = jsonencode([{
+    name = "api", image = var.container_image, essential = true
+    portMappings = [{
+      containerPort = 8000, protocol = "tcp"
+    }]
+    environment = [
+      {
+        name = "DATABASE_SECRET_ARN", value = aws_db_instance.main.master_user_secret[0].secret_arn
+      },
+      {
+        name = "REDIS_URL", value = "rediss://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0?ssl_cert_reqs=required"
+      },
+      {
+        name = "OSRM_URL", value = "http://${aws_service_discovery_service.osrm.name}.${aws_service_discovery_private_dns_namespace.main.name}:5000"
+      },
+      {
+        name = "LLM_PROVIDER", value = "bedrock"
+      },
+      {
+        name = "LLM_MODEL", value = var.bedrock_model_id
+      },
+      {
+        name = "AWS_REGION", value = var.aws_region
+      },
+      {
+        name = "DATABASE_NAME", value = var.db_name
+      },
+      {
+        name = "S3_BUCKET", value = aws_s3_bucket.evidence.bucket
+      },
+      {
+        name = "S3_PUBLIC_BASE_URL", value = "https://${aws_cloudfront_distribution.evidence.domain_name}"
+      }
+    ]
+    logConfiguration = {
+      logDriver = "awslogs", options = {
+        awslogs-group = aws_cloudwatch_log_group.ecs["api"].name, awslogs-region = var.aws_region, awslogs-stream-prefix = "app"
+      }
+    }
+
+  }])
+}
+resource "aws_ecs_service" "api" {
+  name                               = "api"
+  cluster                            = aws_ecs_cluster.main.id
+  task_definition                    = aws_ecs_task_definition.api.arn
+  desired_count                      = var.deploy_services ? 2 : 0
+  launch_type                        = "FARGATE"
+  deployment_minimum_healthy_percent = 50
+  deployment_maximum_percent         = 200
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.api.id]
+    assign_public_ip = true
+  }
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8000
+  }
+  depends_on = [aws_lb_listener.https]
+  lifecycle {
+    precondition {
+      condition     = !var.deploy_services || var.acm_certificate_arn != ""
+      error_message = "Set an issued ACM certificate ARN before deploying API tasks."
+    }
+    precondition {
+      condition     = !var.deploy_services || length(var.allowed_ingress_cidrs) > 0
+      error_message = "Set explicit allowed_ingress_cidrs before deploying the unauthenticated API."
+    }
+    precondition {
+      condition     = alltrue([for cidr in var.allowed_ingress_cidrs : !contains(["0.0.0.0/0", "::/0"], cidr)])
+      error_message = "Do not expose the unauthenticated API ALB to all IPv4 or IPv6 addresses."
+    }
+    precondition {
+      condition     = !var.deploy_services || var.container_image != "public.ecr.aws/docker/library/python:3.11-slim"
+      error_message = "Set container_image to the built immutable RCMCA API image before deploying tasks."
+    }
+    precondition {
+      condition     = !var.deploy_services || var.osrm_image != "ghcr.io/project-osrm/osrm-backend:v5.27.1"
+      error_message = "Set osrm_image to the built Hyderabad OSRM image before deploying tasks."
+    }
+  }
+}
+
+resource "aws_ecs_task_definition" "municipal_sync" {
+  family                   = "${local.name}-municipal-sync"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "512"
+  memory                   = "1024"
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  container_definitions = jsonencode([{
+    name    = "municipal-sync", image = var.container_image, essential = true
+    command = ["python", "-m", "backend.app.worker"]
+    environment = [
+      { name = "DATABASE_SECRET_ARN", value = aws_db_instance.main.master_user_secret[0].secret_arn },
+      { name = "AWS_REGION", value = var.aws_region },
+      { name = "DATABASE_NAME", value = var.db_name },
+      { name = "GHMC_FEED_URL", value = var.ghmc_feed_url },
+      { name = "PRAJAVANI_FEED_URL", value = var.prajavani_feed_url },
+      { name = "GEOCODER_USER_AGENT", value = "RCMCA-road-condition-monitor/1.0" }
+    ]
+    logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.ecs["municipal-sync"].name, awslogs-region = var.aws_region, awslogs-stream-prefix = "worker" } }
+  }])
+}
+resource "aws_ecs_service" "municipal_sync" {
+  name            = "municipal-sync"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.municipal_sync.arn
+  desired_count   = var.deploy_services ? 1 : 0
+  launch_type     = "FARGATE"
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.api.id]
+    assign_public_ip = true
+  }
+}
+
+resource "aws_ecs_task_definition" "vision_worker" {
+  family                   = "${local.name}-vision-worker"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "1024"
+  memory                   = "2048"
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  container_definitions = jsonencode([{
+    name    = "vision-worker", image = var.container_image, essential = true
+    command = ["python", "-m", "scripts.start_vision_worker"]
+    environment = [
+      { name = "DATABASE_SECRET_ARN", value = aws_db_instance.main.master_user_secret[0].secret_arn },
+      { name = "AWS_REGION", value = var.aws_region },
+      { name = "DATABASE_NAME", value = var.db_name },
+      { name = "VISION_MODEL_BUCKET", value = aws_s3_bucket.evidence.bucket },
+      { name = "VISION_MODEL_KEY", value = var.vision_model_key },
+      { name = "VISION_MODEL_PATH", value = "/tmp/road_damage.onnx" },
+      { name = "VISION_CLASS_NAMES", value = "[\"pothole\"]" }
+    ]
+    logConfiguration = { logDriver = "awslogs", options = { awslogs-group = aws_cloudwatch_log_group.ecs["vision-worker"].name, awslogs-region = var.aws_region, awslogs-stream-prefix = "worker" } }
+  }])
+}
+resource "aws_ecs_service" "vision_worker" {
+  name            = "vision-worker"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.vision_worker.arn
+  desired_count   = var.deploy_services ? 1 : 0
+  launch_type     = "FARGATE"
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.api.id]
+    assign_public_ip = true
+  }
+}
+
+resource "aws_service_discovery_private_dns_namespace" "main" {
+  name = "${local.name}.internal"
+  vpc  = aws_vpc.main.id
+}
+resource "aws_service_discovery_service" "osrm" {
+  name = "osrm"
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.main.id
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+    routing_policy = "MULTIVALUE"
+  }
+  health_check_custom_config {
+    failure_threshold = 1
+  }
+}
+resource "aws_ecs_task_definition" "osrm" {
+  family                   = "${local.name}-osrm"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "2048"
+  memory                   = "4096"
+  execution_role_arn       = aws_iam_role.execution.arn
+  task_role_arn            = aws_iam_role.task.arn
+  container_definitions = jsonencode([{
+    name = "osrm", image = var.osrm_image, essential = true
+    portMappings = [{
+      containerPort = 5000, protocol = "tcp"
+    }]
+    command = ["osrm-routed", "--algorithm", "mld", "/data/hyderabad.osrm"]
+    logConfiguration = {
+      logDriver = "awslogs", options = {
+        awslogs-group = aws_cloudwatch_log_group.ecs["osrm"].name, awslogs-region = var.aws_region, awslogs-stream-prefix = "app"
+      }
+    }
+
+  }])
+}
+resource "aws_ecs_service" "osrm" {
+  name            = "osrm"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.osrm.arn
+  desired_count   = var.deploy_services ? 2 : 0
+  launch_type     = "FARGATE"
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.osrm.id]
+    assign_public_ip = true
+  }
+  service_registries {
+    registry_arn = aws_service_discovery_service.osrm.arn
+  }
+}
+
