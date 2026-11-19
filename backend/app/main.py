@@ -7,6 +7,7 @@ from pathlib import Path
 import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from redis.asyncio import Redis
 
 from rcmc_graph import IssueFacts, rcmc_app
@@ -15,7 +16,8 @@ from .database import database_url
 from .routes.issues import router as issues_router
 from .routes.routing import router as routing_router
 from .routes.vision import router as vision_router
-from .routes.uploads import router as uploads_router
+from .routes.uploads import UPLOAD_DIR, router as uploads_router
+from .routes.chat import router as chat_router
 from .schemas import IssueAssessmentRequest
 
 
@@ -54,6 +56,9 @@ app.include_router(issues_router)
 app.include_router(routing_router)
 app.include_router(vision_router)
 app.include_router(uploads_router)
+app.include_router(chat_router)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 
 @app.get("/health")

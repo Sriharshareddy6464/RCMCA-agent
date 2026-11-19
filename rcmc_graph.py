@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import json
-from typing import Literal, TypedDict
+from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
@@ -48,6 +48,34 @@ class IssueState(TypedDict, total=False):
     action_required: str
     complaint_subject: str
     complaint_draft: str
+
+
+class ChatIntent(BaseModel):
+    """Structured intent parsed from a conversational navigation/issue request."""
+
+    action: Literal["route", "issue", "other"]
+    origin: str | None = Field(
+        default=None,
+        description="Origin place name; use 'current location' when the user says here or my location",
+    )
+    destination: str | None = Field(default=None, description="Destination place name")
+    issue_id: str | None = Field(default=None, description="UUID of the referenced road issue, if present")
+    issue_query: str | None = Field(
+        default=None,
+        description="Short identifying phrase with the issue category and locality, when available",
+    )
+    language: Literal["en", "te", "hi"] = "en"
+
+
+class ChatState(TypedDict, total=False):
+    message: str
+    user_lat: float | None
+    user_lon: float | None
+    intent: ChatIntent
+    route_audit: dict[str, Any]
+    issue: dict[str, Any]
+    email_draft: ComplaintDraft
+    answer: str
 
 
 def _model():
@@ -154,6 +182,112 @@ def build_issue_graph(chat_model=None):
     builder.add_edge("normalize_report", "prioritize")
     builder.add_edge("prioritize", "draft_complaint")
     builder.add_edge("draft_complaint", END)
+    return builder.compile()
+
+
+def build_chat_graph(
+    route_auditor: Callable[[ChatIntent, ChatState], Awaitable[dict[str, Any]]],
+    issue_resolver: Callable[[ChatIntent, ChatState], Awaitable[dict[str, Any]]],
+    chat_model=None,
+):
+    """Build a conversational intent graph with deterministic route/issue tools.
+
+    The model extracts intent and drafts issue correspondence. Route scoring and
+    issue lookup remain application/PostGIS operations supplied by the API.
+    """
+    llm = chat_model or _model()
+    intent_llm = llm.with_structured_output(ChatIntent)
+    email_llm = llm.with_structured_output(ComplaintDraft)
+
+    async def interpret_message(state: ChatState) -> dict[str, Any]:
+        intent = await intent_llm.ainvoke(
+            [
+                (
+                    "system",
+                    "Classify the user's Hyderabad road-monitoring request. Use action=route "
+                    "when they ask to travel, navigate, compare a route, or go from one "
+                    "place to another. Extract origin and destination as concise place names; "
+                    "if they say 'here', 'from my location', or equivalent, set origin to "
+                    "'current location'. Use action=issue when they ask about a reported road "
+                    "issue or want an inspection/repair complaint; preserve any UUID and "
+                    "extract a short category/locality search phrase. Otherwise use action=other. "
+                    "Never invent a place name or issue ID. Set language to en, te, or hi.",
+                ),
+                (
+                    "human",
+                    json.dumps(
+                        {
+                            "message": state["message"],
+                            "user_location": {
+                                "latitude": state.get("user_lat"),
+                                "longitude": state.get("user_lon"),
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                ),
+            ]
+        )
+        return {"intent": ChatIntent.model_validate(intent)}
+
+    async def run_route_audit(state: ChatState) -> dict[str, Any]:
+        intent = state["intent"]
+        audit = await route_auditor(intent, state)
+        return {"route_audit": audit}
+
+    async def find_issue_and_draft_email(state: ChatState) -> dict[str, Any]:
+        intent = state["intent"]
+        issue = await issue_resolver(intent, state)
+        email = await email_llm.ainvoke(
+            [
+                (
+                    "system",
+                    "Draft a concise, respectful municipal inspection/repair email using "
+                    "only the supplied database issue record. Do not invent a date, street, "
+                    "impact, repair history, or official finding. Include the recorded issue "
+                    "description, ward, corporation, status, and a request to inspect and take "
+                    "appropriate action. Write in the requested language (en=English, "
+                    "te=Telugu, hi=Hindi). This is a draft only; do not claim it was sent.",
+                ),
+                (
+                    "human",
+                    json.dumps(
+                        {"language": intent.language, "issue": issue},
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                ),
+            ]
+        )
+        return {"issue": issue, "email_draft": ComplaintDraft.model_validate(email)}
+
+    def other_response(_state: ChatState) -> dict[str, str]:
+        return {
+            "answer": (
+                "I can compare Hyderabad road routes or look up a reported issue. "
+                "For a route, provide a start and destination; for an issue, include "
+                "its ID or a category and locality."
+            )
+        }
+
+    builder = StateGraph(ChatState)
+    builder.add_node("interpret_message", interpret_message)
+    builder.add_node("route_audit", run_route_audit)
+    builder.add_node("issue_lookup_and_email", find_issue_and_draft_email)
+    builder.add_node("other_response", other_response)
+    builder.add_edge(START, "interpret_message")
+    builder.add_conditional_edges(
+        "interpret_message",
+        lambda state: state["intent"].action,
+        {
+            "route": "route_audit",
+            "issue": "issue_lookup_and_email",
+            "other": "other_response",
+        },
+    )
+    builder.add_edge("route_audit", END)
+    builder.add_edge("issue_lookup_and_email", END)
+    builder.add_edge("other_response", END)
     return builder.compile()
 
 
