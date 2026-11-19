@@ -20,3 +20,5 @@ osrm-data/*
 **/.dart_tool/
 build/
 mobile/build/
+
+uploads/
