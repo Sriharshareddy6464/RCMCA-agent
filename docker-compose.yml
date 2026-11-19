@@ -1,0 +1,141 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_only}
+      POSTGRES_DB: ${POSTGRES_DB:-road_intelligence}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgis_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  osrm:
+    image: ghcr.io/project-osrm/osrm-backend:v5.27.1
+    ports:
+      - "127.0.0.1:${OSRM_HOST_PORT:-5001}:5000"
+    volumes:
+      - ./osrm-data:/data:ro
+    command: ["osrm-routed", "--algorithm", "mld", "/data/hyderabad.osrm"]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8001}:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres_dev_only@postgis:5432/road_intelligence}
+      REDIS_URL: redis://redis:6379/0
+      OSRM_URL: http://osrm:5000
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai_compatible}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_PUBLIC_BASE_URL: ${S3_PUBLIC_BASE_URL:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-ollama-local}
+      LLM_MODEL: ${LLM_MODEL:-qwen2.5:3b}
+      GEOCODER_USER_AGENT: ${GEOCODER_USER_AGENT:-RCMCA-road-condition-monitor/0.2}
+      VISION_MODEL_PATH: ${VISION_MODEL_PATH:-/models/road_damage.onnx}
+      VISION_CLASS_NAMES: ${VISION_CLASS_NAMES:-}
+      VISION_CONFIDENCE_THRESHOLD: ${VISION_CONFIDENCE_THRESHOLD:-0.35}
+      VISION_NMS_THRESHOLD: ${VISION_NMS_THRESHOLD:-0.45}
+      VISION_SEVERITY_AREA_THRESHOLDS: ${VISION_SEVERITY_AREA_THRESHOLDS:-0.01,0.03,0.08,0.2}
+    volumes:
+      - ./models:/models:ro
+    depends_on:
+      postgis:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      osrm:
+        condition: service_started
+
+  vllm:
+    image: vllm/vllm-openai:${VLLM_IMAGE_TAG:-v0.11.2}
+    profiles: [inference]
+    ipc: host
+    command:
+      - ${VLLM_MODEL:-Qwen/Qwen2.5-3B-Instruct-AWQ}
+      - --quantization
+      - awq_marlin
+      - --dtype
+      - half
+      - --max-model-len
+      - ${VLLM_MAX_MODEL_LEN:-4096}
+      - --gpu-memory-utilization
+      - ${VLLM_GPU_MEMORY_UTILIZATION:-0.82}
+    environment:
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:${VLLM_HOST_PORT:-8002}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  municipal-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "backend.app.worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres_dev_only@postgis:5432/road_intelligence}
+      GHMC_FEED_URL: ${GHMC_FEED_URL:-}
+      PRAJAVANI_FEED_URL: ${PRAJAVANI_FEED_URL:-}
+      GEOCODER_BASE_URL: ${GEOCODER_BASE_URL:-https://nominatim.openstreetmap.org}
+      GEOCODER_USER_AGENT: ${GEOCODER_USER_AGENT:-RCMCA-road-condition-monitor/0.2}
+      MUNICIPAL_SYNC_INTERVAL_SECONDS: ${MUNICIPAL_SYNC_INTERVAL_SECONDS:-1800}
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+  vision-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "-m", "backend.app.vision_worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres_dev_only@postgis:5432/road_intelligence}
+      VISION_MODEL_PATH: ${VISION_MODEL_PATH:-/models/road_damage.onnx}
+      VISION_CLASS_NAMES: ${VISION_CLASS_NAMES:-["pothole"]}
+      VISION_CONFIDENCE_THRESHOLD: ${VISION_CONFIDENCE_THRESHOLD:-0.35}
+      VISION_NMS_THRESHOLD: ${VISION_NMS_THRESHOLD:-0.45}
+      VISION_SEVERITY_AREA_THRESHOLDS: ${VISION_SEVERITY_AREA_THRESHOLDS:-0.01,0.03,0.08,0.2}
+      VISION_WORKER_POLL_SECONDS: ${VISION_WORKER_POLL_SECONDS:-0.5}
+      VISION_WORKER_RECLAIM_SECONDS: ${VISION_WORKER_RECLAIM_SECONDS:-60}
+    volumes:
+      - ./models:/models:ro
+    depends_on:
+      postgis:
+        condition: service_healthy
+
+volumes:
+  postgis_data:
+  redis_data:
+  huggingface_cache:
