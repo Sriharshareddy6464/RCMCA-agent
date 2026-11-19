@@ -1,0 +1,19 @@
+# Copy to production.tfvars only after creating the required AWS resources.
+# Keep production.tfvars private and out of version control.
+aws_region       = "ap-south-1"
+deploy_services  = true
+db_engine_version = "16.15"
+
+# Replace with immutable RCMCA image URIs after the ECR bootstrap and image push.
+container_image = "<account-id>.dkr.ecr.ap-south-1.amazonaws.com/rcmca/api:<immutable-tag>"
+osrm_image      = "<account-id>.dkr.ecr.ap-south-1.amazonaws.com/rcmca/osrm:<immutable-tag>"
+
+# Replace with an issued ACM certificate ARN and the field-trial client's public CIDR.
+acm_certificate_arn   = "arn:aws:acm:ap-south-1:<account-id>:certificate/<certificate-id>"
+allowed_ingress_cidrs  = ["<client-public-ip>/32"]
+vision_model_key       = "models/road_damage.onnx"
+upload_allowed_origins = ["https://<your-app-domain>"]
+
+# Populate only when an authorized CSV/JSON municipal export is available.
+ghmc_feed_url      = ""
+prajavani_feed_url = ""
