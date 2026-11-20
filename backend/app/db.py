@@ -5,7 +5,7 @@ from typing import Any
 ISSUE_FIELDS = """
 id, category::text AS category, severity, confidence_score, report_count,
 description, evidence_image_url, ST_Y(location::geometry) AS latitude,
-ST_X(location::geometry) AS longitude, source, external_ticket_id,
+ST_X(location::geometry) AS longitude, source, source_url, external_ticket_id,
 status::text AS status, created_at, updated_at
 """
 

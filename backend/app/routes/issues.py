@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException, Request
 from redis.exceptions import RedisError
 
 from ..db import ISSUE_FIELDS, issue_dict
+from ..migrations import ensure_hyd_demo_issues
 from ..schemas import (
     IssueReportRequest,
     IssueReportResponse,
@@ -16,6 +17,7 @@ from ..schemas import (
     VerifyIssueRequest,
     VerifyIssueResponse,
 )
+from ..scrape_hyd_civic import scrape_feeds
 
 router = APIRouter(prefix="/api/v1/issues", tags=["issues"])
 
@@ -71,6 +73,21 @@ async def list_issues(request: Request, south: float, west: float, north: float,
             bounds.west, bounds.south, bounds.east, bounds.north, bounds.limit,
         )
     return [_issue_out(row) for row in records]
+
+
+@router.post("/refresh")
+async def refresh_issues(request: Request):
+    """Refresh public civic news and ensure the Hyderabad demo issue set exists."""
+    pool = request.app.state.db
+    # Seed first so a public feed outage never prevents the map from having a
+    # complete local issue set. This is idempotent and also runs at startup.
+    async with pool.acquire() as connection:
+        await ensure_hyd_demo_issues(connection)
+
+    imported = await scrape_feeds(pool)
+    async with pool.acquire() as connection:
+        total_issues = await connection.fetchval("SELECT COUNT(*) FROM road_issues")
+    return {"imported": imported, "total_issues": int(total_issues or 0)}
 
 
 async def _evidence_for_issue(connection, issue_id: UUID) -> list[dict]:

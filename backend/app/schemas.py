@@ -67,6 +67,7 @@ class IssueResponse(BaseModel):
     latitude: float
     longitude: float
     source: str
+    source_url: str | None = None
     external_ticket_id: str | None
     status: HazardStatus
     created_at: datetime

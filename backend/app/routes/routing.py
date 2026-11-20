@@ -1,66 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import os
-import re
-import unicodedata
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
-from ..services.geocoding import geocode_locality
+from ..services.geocoding import geocode_locality, resolve_hyderabad_locality
 
-# These local ward centers/labels are the ward gazetteer already seeded by the
-# application. Landmark aliases map to the closest available local center; any
-# unmatched place name is resolved through the cached geocoding service.
-_LOCAL_PLACES: dict[str, tuple[str, str, float, float]] = {
-    "khairatabad": ("Khairatabad", "GHMC", 17.4120, 78.4600),
-    "banjara hills": ("Banjara Hills", "GHMC", 17.4126, 78.4482),
-    "sanathnagar": ("Sanathnagar", "GHMC", 17.4560, 78.4440),
-    "tarnaka": ("Tarnaka", "GHMC", 17.4270, 78.5320),
-    "pathergatti": ("Pathergatti", "GHMC", 17.3600, 78.4740),
-    "kondapur": ("Kondapur", "CMC", 17.4690, 78.3640),
-    "gachibowli": ("Gachibowli", "CMC", 17.4400, 78.3480),
-    "madhapur": ("Madhapur", "CMC", 17.4480, 78.3910),
-    "kphb colony": ("KPHB Colony", "CMC", 17.4930, 78.3990),
-    "jeedimetla": ("Jeedimetla", "CMC", 17.5110, 78.4400),
-    "malkajgiri": ("Malkajgiri", "MMC", 17.4560, 78.5270),
-    "ramanthapur": ("Ramanthapur", "MMC", 17.3990, 78.5410),
-    "vanasthalipuram": ("Vanasthalipuram", "MMC", 17.3300, 78.5720),
-    "kapra": ("Kapra", "MMC", 17.4780, 78.5640),
-}
-_LOCAL_ALIASES = {
-    "charminar": "pathergatti",
-    "ghmc": "khairatabad",
-    "ghmc headquarters": "khairatabad",
-    "greater hyderabad municipal corporation": "khairatabad",
-    "hitech city": "madhapur",
-    "hi tech city": "madhapur",
-    "hitec city": "madhapur",
-    "cyber towers": "madhapur",
-    "cyberabad": "gachibowli",
-    "cyberabad cmc": "gachibowli",
-    "cyberabad municipal corporation": "gachibowli",
-    "financial district": "gachibowli",
-    "gachibowli stadium": "gachibowli",
-    "kukatpally": "kphb colony",
-    "uppal": "ramanthapur",
-    "lb nagar": "vanasthalipuram",
-    "malkajgiri mmc": "malkajgiri",
-    "malkajgiri municipal corporation": "malkajgiri",
-    "malkajgiri railway station": "malkajgiri",
-    "ecil": "kapra",
-}
-
-
-def _place_key(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", value).casefold()
-    normalized = "".join(c for c in normalized if not unicodedata.combining(c))
-    normalized = re.sub(r"[^\w\s]", " ", normalized)
-    words = [w for w in normalized.split() if w not in {"hyderabad", "telangana", "india"}]
-    return " ".join(words)
+logger = logging.getLogger(__name__)
 
 
 class RouteRequest(BaseModel):
@@ -104,17 +56,9 @@ async def resolve_route_place(value: str | list[float] | dict[str, float], reque
         return _coerce_coordinate(value)
 
     query = value.strip()
-    key = _place_key(query)
-    key = _LOCAL_ALIASES.get(key, key)
-    if key in _LOCAL_PLACES:
-        label, corporation, latitude, longitude = _LOCAL_PLACES[key]
-        return {
-            "latitude": latitude,
-            "longitude": longitude,
-            "display_name": label,
-            "corporation": corporation,
-            "resolution": "local_landmark",
-        }
+    local = resolve_hyderabad_locality(query)
+    if local:
+        return local
 
     # The ward table is a local fallback for seeded ward names and avoids a
     # network lookup when the exact locality is already known to the database.
@@ -145,9 +89,11 @@ async def resolve_route_place(value: str | list[float] | dict[str, float], reque
             )
         }
         async with httpx.AsyncClient(
-            base_url=geocoder_base, headers=headers, timeout=httpx.Timeout(12.0)
+            base_url=geocoder_base, headers=headers, timeout=httpx.Timeout(4.0)
         ) as geocoder:
-            place = await geocode_locality(request.app.state.db, geocoder, query)
+            place = await geocode_locality(
+                request.app.state.db, geocoder, query, timeout_seconds=4.0
+            )
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=503, detail="Place geocoding is unavailable") from exc
     except Exception as exc:
@@ -208,6 +154,51 @@ def _recommendation_key(route: dict[str, Any]) -> tuple:
     )
 
 
+def _fallback_routes(origin: dict[str, Any], destination: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build clearly labeled approximate multi-waypoint lines if OSRM is offline."""
+    start = (float(origin["longitude"]), float(origin["latitude"]))
+    end = (float(destination["longitude"]), float(destination["latitude"]))
+    mean_lat = math.radians((start[1] + end[1]) / 2)
+    dx = (end[0] - start[0]) * math.cos(mean_lat)
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy) or 1.0
+    perp_x, perp_y = -dy / length, dx / length
+    routes = []
+    # These are approximate corridors for map continuity, not turn-by-turn
+    # road-network routes. PostGIS still audits each line's hazard corridor.
+    for index, offset in enumerate((0.0, 0.006, -0.006), start=1):
+        coordinates = []
+        for step in range(7):
+            t = step / 6
+            curve = math.sin(math.pi * t) * offset
+            longitude = start[0] + (end[0] - start[0]) * t
+            latitude = start[1] + (end[1] - start[1]) * t
+            longitude += (perp_x * curve) / max(math.cos(mean_lat), 0.2)
+            latitude += perp_y * curve
+            coordinates.append([longitude, latitude])
+        distance_km = sum(
+            _great_circle_km(coordinates[i - 1], coordinates[i])
+            for i in range(1, len(coordinates))
+        )
+        routes.append(
+            {
+                "route_id": f"fallback_{index}",
+                "distance": distance_km * 1000,
+                "duration": (distance_km / 22.0) * 3600,
+                "geometry": {"type": "LineString", "coordinates": coordinates},
+            }
+        )
+    return routes
+
+
+def _great_circle_km(left: list[float], right: list[float]) -> float:
+    lon1, lat1 = map(math.radians, left)
+    lon2, lat2 = map(math.radians, right)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    value = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 6371.0088 * 2 * math.asin(min(1.0, math.sqrt(value)))
+
+
 async def audit_routes(
     origin: str | list[float] | dict[str, float],
     destination: str | list[float] | dict[str, float],
@@ -220,24 +211,29 @@ async def audit_routes(
         f"{resolved_origin['longitude']:.7f},{resolved_origin['latitude']:.7f};"
         f"{resolved_destination['longitude']:.7f},{resolved_destination['latitude']:.7f}"
     )
+    fallback_used = False
     try:
-        response = await request.app.state.osrm.get(
-            f"/route/v1/driving/{coordinates}",
-            params={
-                "alternatives": 3,
-                "steps": "false",
-                "geometries": "geojson",
-                "overview": "full",
-            },
+        response = await asyncio.wait_for(
+            request.app.state.osrm.get(
+                f"/route/v1/driving/{coordinates}",
+                params={
+                    "alternatives": 3,
+                    "steps": "false",
+                    "geometries": "geojson",
+                    "overview": "full",
+                },
+            ),
+            timeout=8.0,
         )
         response.raise_for_status()
         route_payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail="Routing engine is unavailable") from exc
-
-    candidates = route_payload.get("routes") or []
-    if not candidates:
-        raise HTTPException(status_code=422, detail="OSRM could not find a route")
+        candidates = route_payload.get("routes") or []
+        if not candidates:
+            raise ValueError("OSRM returned no route candidates")
+    except Exception as exc:
+        logger.warning("OSRM route lookup failed; using approximate corridor geometry (%s)", type(exc).__name__)
+        candidates = _fallback_routes(resolved_origin, resolved_destination)
+        fallback_used = True
 
     try:
         routes = []
@@ -247,8 +243,11 @@ async def audit_routes(
             )
             routes.append(
                 {
-                    "route_id": f"route_{index}",
-                    "label": f"Alternative {index}",
+                    "route_id": candidate.get("route_id", f"route_{index}"),
+                    "label": (
+                        f"Approximate fallback corridor {index}"
+                        if fallback_used else f"Alternative {index}"
+                    ),
                     "is_recommended": False,
                     "distance_km": candidate["distance"] / 1000.0,
                     "duration_min": candidate["duration"] / 60.0,
@@ -263,7 +262,9 @@ async def audit_routes(
 
     recommended = min(routes, key=_recommendation_key)
     recommended["is_recommended"] = True
-    recommended["label"] = "Safest available route"
+    recommended["label"] = (
+        "Lowest-hazard approximate corridor" if fallback_used else "Safest available route"
+    )
     recommended_critical = any(
         issue["status_color"] in {"ORANGE", "RED"}
         for issue in recommended["issues_on_route"]
@@ -280,6 +281,7 @@ async def audit_routes(
         "alternatives_considered": len(routes),
         "recommended_route_id": recommended["route_id"],
         "routes": routes,
+        "routing_source": "fallback_geometry" if fallback_used else "osrm",
         # Preserve the original route response fields consumed by existing clients.
         "geometry": recommended["geometry"],
         "distance_m": recommended["distance_km"] * 1000.0,
