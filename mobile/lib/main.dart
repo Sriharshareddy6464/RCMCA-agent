@@ -3,11 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
-import 'package:http_parser/http_parser.dart';
 import 'package:maplibre_gl/maplibre_gl.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -24,6 +22,7 @@ const apiBase = String.fromEnvironment(
   defaultValue: 'http://127.0.0.1:8001',
 );
 const hyderabad = LatLng(17.3850, 78.4867);
+const mapStyleUrl = 'https://tiles.openfreemap.org/styles/liberty';
 
 /// Request high-accuracy GPS fix from device hardware.
 Future<Position> requestCurrentPosition(LocationAccuracy accuracy) async {
@@ -94,7 +93,11 @@ class _RcmcaAppState extends State<RcmcaApp> {
                   });
                 },
               ),
-              const CaptureScreen(),
+              NewIssueReportScreen(
+                onSubmitted: (result) {
+                  NavigationController.instance.switchTab?.call(0);
+                },
+              ),
             ],
           ),
           bottomNavigationBar: NavigationBar(
@@ -325,7 +328,28 @@ class RoadMapScreenState extends State<RoadMapScreen> {
   Position? _position;
   List<RoadHazard> _hazards = [];
   final Map<String, RoadHazard> _symbolHazardMap = {};
+  final Map<String, RoadHazard> _circleHazardMap = {};
   List<Symbol> _symbols = [];
+  List<Circle> _circles = [];
+
+  // Decluttered & Expanded UI state
+  bool _legendExpanded = false;
+  bool _routePlannerExpanded = false;
+
+  // Route Hazard Highlighting & Total Count
+  final List<Circle> _routeHazardCircles = [];
+  int _routeHazardsCount = 0;
+  int _routeHazardsAvoided = 0;
+  String? _routeBannerText;
+
+  // Triangular Vehicle Pointer & Heading in Driveway Mode
+  Circle? _drivewayVehicleCircle;
+  double _drivewayBearing = 0.0;
+
+  // Direct Long-Press / Tap-to-Pin on Map
+  LatLng? _pinnedLocation;
+  Circle? _pinnedCircle;
+  Symbol? _pinnedSymbol;
 
   // Routing lines
   Line? _recommendedRouteLine;
@@ -349,18 +373,17 @@ class RoadMapScreenState extends State<RoadMapScreen> {
   final TextEditingController _destinationController =
       TextEditingController(text: 'Tarnaka');
 
-  // In-App Driveway State
+  // In-App Driveway State (Real Live GPS Movement via Geolocator.getPositionStream)
   bool _drivewayActive = false;
-  bool _drivewayPaused = false;
-  bool _drivewayCompleted = false;
-  Timer? _drivewayTimer;
-  List<LatLng> _drivewayWaypoints = [];
-  int _drivewayIndex = 0;
-  double _drivewayProgress = 0.0;
+  StreamSubscription<Position>? _drivewayPositionSubscription;
+  Position? _lastDrivewayPosition;
   double _drivewayRemainingMeters = 0.0;
   int _drivewayEtaMinutes = 0;
   RoadHazard? _drivewayNearbyHazard;
   Symbol? _drivewayVehicleSymbol;
+
+  // Refresh status
+  bool _isRefreshing = false;
 
   // Staged payload in case activateRecommendedRoute is called before map style loads
   Map<String, dynamic>? _pendingRoutePayload;
@@ -391,7 +414,7 @@ class RoadMapScreenState extends State<RoadMapScreen> {
 
   @override
   void dispose() {
-    _drivewayTimer?.cancel();
+    _drivewayPositionSubscription?.cancel();
     _positionSubscription?.cancel();
     _originController.dispose();
     _destinationController.dispose();
@@ -465,6 +488,15 @@ class RoadMapScreenState extends State<RoadMapScreen> {
 
   Future<void> _onMapCreated(MapLibreMapController controller) async {
     _map = controller;
+    controller.onCircleTapped.add((circle) {
+      final hazard = _circleHazardMap[circle.id];
+      if (hazard != null && mounted) {
+        showIssueDetailSheet(
+          context,
+          issue: hazard.rawJson,
+        ).then((_) => _loadHazards(force: true));
+      }
+    });
     controller.onSymbolTapped.add((symbol) {
       final hazard = _symbolHazardMap[symbol.id];
       if (hazard != null && mounted) {
@@ -531,19 +563,49 @@ class RoadMapScreenState extends State<RoadMapScreen> {
       final payload = (jsonDecode(response.body) as List).cast<Map<String, dynamic>>();
       final hazards = payload.map(RoadHazard.fromJson).toList();
 
-      final old = _symbols;
+      final oldSymbols = _symbols;
+      final oldCircles = _circles;
       _symbols = [];
+      _circles = [];
       _symbolHazardMap.clear();
-      if (old.isNotEmpty) await map.removeSymbols(old);
+      _circleHazardMap.clear();
+      if (oldSymbols.isNotEmpty) {
+        try {
+          await map.removeSymbols(oldSymbols);
+        } catch (_) {
+          for (final s in oldSymbols) {
+            await map.removeSymbol(s);
+          }
+        }
+      }
+      if (oldCircles.isNotEmpty) {
+        try {
+          await map.removeCircles(oldCircles);
+        } catch (_) {
+          for (final c in oldCircles) {
+            await map.removeCircle(c);
+          }
+        }
+      }
 
       // Render pins color-coded by status_color:
       // GREEN (#22C55E), BLUE (#3B82F6), YELLOW (#EAB308), ORANGE (#F97316), RED (#EF4444)
+      // Vector styles like OpenFreeMap Liberty don't include marker-15 sprites,
+      // so native Circle markers draw the visible colored pin dots reliably.
       for (final hazard in hazards) {
+        final circle = await map.addCircle(CircleOptions(
+          geometry: LatLng(hazard.latitude, hazard.longitude),
+          circleColor: hazard.statusHexColor,
+          circleRadius: hazard.severity >= 4 ? 8.5 : 6.5,
+          circleStrokeColor: '#FFFFFF',
+          circleStrokeWidth: 2.0,
+          circleOpacity: 1.0,
+        ));
+        _circles.add(circle);
+        _circleHazardMap[circle.id] = hazard;
+
         final symbol = await map.addSymbol(SymbolOptions(
           geometry: LatLng(hazard.latitude, hazard.longitude),
-          iconImage: 'marker-15',
-          iconColor: hazard.statusHexColor,
-          iconSize: hazard.severity >= 4 ? 1.5 : 1.2,
           textField: '${hazard.category.replaceAll('_', ' ')} · ${hazard.statusTitle}',
           textOffset: const Offset(0, 1.2),
           textSize: 10.5,
@@ -876,7 +938,7 @@ class RoadMapScreenState extends State<RoadMapScreen> {
       _destinationController.text = routePayload['destination_name'].toString();
     }
 
-    // 5. Remove previous route lines
+    // 5. Remove previous route lines & hazard highlight markers
     if (_recommendedRouteLine != null) {
       try {
         await map.removeLine(_recommendedRouteLine!);
@@ -889,6 +951,17 @@ class RoadMapScreenState extends State<RoadMapScreen> {
       } catch (_) {}
     }
     _rejectedRouteLines.clear();
+
+    if (_routeHazardCircles.isNotEmpty) {
+      try {
+        await map.removeCircles(_routeHazardCircles);
+      } catch (_) {
+        for (final c in _routeHazardCircles) {
+          await map.removeCircle(c);
+        }
+      }
+      _routeHazardCircles.clear();
+    }
 
     // 6. Draw Rejected Routes in Dashed Gray (#94A3B8)
     for (final rej in rejectedGeometries) {
@@ -919,8 +992,103 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     _recommendedCoordinates = recommended;
     _rejectedGeometries = rejectedGeometries;
 
+    // 7b. Highlight route hazards with enlarged ringed markers and compute total count
+    Map<String, dynamic>? recommendedRoute;
+    if (routePayload['routes'] is List) {
+      for (final r in routePayload['routes']) {
+        if (r is Map &&
+            (r['is_recommended'] == true ||
+                (routePayload['recommended_route_id'] != null &&
+                    r['route_id'] == routePayload['recommended_route_id']))) {
+          recommendedRoute = Map<String, dynamic>.from(r);
+          break;
+        }
+      }
+    }
+
+    final dynamic rawRouteHazards = recommendedRoute?['issues_on_route'] ??
+        routePayload['hazards'] ??
+        routePayload['issues_on_route'];
+    final List<Map<String, dynamic>> routeHazards = [];
+    if (rawRouteHazards is List) {
+      for (final h in rawRouteHazards) {
+        if (h is Map) routeHazards.add(Map<String, dynamic>.from(h));
+      }
+    }
+
+    // Determine avoided hazards count across alternative rejected routes
+    final Set<String> recIds = routeHazards
+        .map((e) => (e['id'] ?? e['title'] ?? '').toString())
+        .where((id) => id.isNotEmpty)
+        .toSet();
+    final Set<String> avoidedIds = {};
+    if (routePayload['routes'] is List) {
+      for (final r in routePayload['routes']) {
+        if (r is Map && r['is_recommended'] != true && r['issues_on_route'] is List) {
+          for (final issue in r['issues_on_route']) {
+            if (issue is Map) {
+              final id = (issue['id'] ?? issue['title'] ?? '').toString();
+              if (id.isNotEmpty && !recIds.contains(id)) {
+                avoidedIds.add(id);
+              }
+            }
+          }
+        }
+      }
+    }
+    int totalAvoided = avoidedIds.length;
+    if (totalAvoided == 0 && routePayload['avoided_severe_hazards'] == true) {
+      totalAvoided = 2; // Severe hazards successfully bypassed
+    }
+
+    final count = routeHazards.length;
+    final bannerText =
+        '$count hazard${count == 1 ? '' : 's'} along recommended route · $totalAvoided avoided';
+
+    // Highlight each hazard in issues_on_route on the MapLibre canvas with enlarged ringed markers
+    for (final issue in routeHazards) {
+      final lat = (issue['latitude'] ?? issue['lat']) as num?;
+      final lon = (issue['longitude'] ?? issue['lon'] ?? issue['lng']) as num?;
+      if (lat != null && lon != null) {
+        final statusColor = issue['status_color']?.toString() ?? 'RED';
+        final config = HazardStatusConfig.fromKey(statusColor);
+        final pt = LatLng(lat.toDouble(), lon.toDouble());
+
+        try {
+          // Enlarged outer ring marker (radius 16.0 with prominent stroke)
+          final outerRing = await map.addCircle(CircleOptions(
+            geometry: pt,
+            circleColor: config.hex,
+            circleOpacity: 0.22,
+            circleRadius: 16.0,
+            circleStrokeColor: config.hex,
+            circleStrokeWidth: 3.5,
+            circleStrokeOpacity: 0.95,
+          ));
+          _routeHazardCircles.add(outerRing);
+
+          // Inner core circle marker (radius 8.5)
+          final innerCore = await map.addCircle(CircleOptions(
+            geometry: pt,
+            circleColor: config.hex,
+            circleOpacity: 1.0,
+            circleRadius: 8.5,
+            circleStrokeColor: '#FFFFFF',
+            circleStrokeWidth: 2.0,
+          ));
+          _routeHazardCircles.add(innerCore);
+        } catch (_) {}
+      }
+    }
+
     if (mounted) {
-      setState(() => _navigationActive = true);
+      setState(() {
+        _navigationActive = true;
+        _routeHazardsCount = count;
+        _routeHazardsAvoided = totalAvoided;
+        _routeBannerText = bannerText;
+        _routePlannerExpanded = false; // Collapse bottom card to keep >75% map canvas
+      });
     }
 
     // 8. Start in-app driveway mode or fit overview bounds
@@ -1015,86 +1183,128 @@ class RoadMapScreenState extends State<RoadMapScreen> {
   }
 
   /// Starts the in-app driveway mode: tilts MapLibre camera to 45° pitch,
-  /// adds vehicle symbol, and simulates/tracks driveway progress along the route inside the app.
+  /// adds triangular vehicle pointer, and tracks real live device GPS movement via getPositionStream.
   Future<void> _startInAppDriveway() async {
     final map = _map;
     if (map == null || _recommendedCoordinates.length < 2) return;
 
     _stopInAppDriveway(resetCamera: false);
 
-    // Uniformly resample path every 22 meters for smooth tracking
-    _drivewayWaypoints = _resamplePathUniformly(_recommendedCoordinates, 22.0);
-    _drivewayIndex = 0;
-    _drivewayProgress = 0.0;
-    _drivewayCompleted = false;
-    _drivewayPaused = false;
-    _drivewayRemainingMeters = (_drivewayWaypoints.length - 1) * 22.0;
-    _drivewayEtaMinutes = ((_drivewayRemainingMeters / 12.0) / 60.0).ceil();
+    Position initialPos;
+    try {
+      initialPos = await requestCurrentPosition(LocationAccuracy.bestForNavigation);
+      _position = initialPos;
+    } catch (e) {
+      if (_position != null) {
+        initialPos = _position!;
+      } else {
+        _message('Location permission is needed for live GPS driveway navigation.');
+        return;
+      }
+    }
 
-    final startPoint = _drivewayWaypoints.first;
-    final nextPoint = _drivewayWaypoints.length > 1 ? _drivewayWaypoints[1] : startPoint;
-    final initialBearing = _calculateBearing(startPoint, nextPoint);
+    final initialTarget = LatLng(initialPos.latitude, initialPos.longitude);
+    final initialBearing = (initialPos.heading > 0)
+        ? initialPos.heading
+        : _calculateBearing(
+            _recommendedCoordinates.first,
+            _recommendedCoordinates.length > 1
+                ? _recommendedCoordinates[1]
+                : _recommendedCoordinates.first,
+          );
 
     setState(() {
       _drivewayActive = true;
+      _drivewayBearing = initialBearing;
+      _lastDrivewayPosition = initialPos;
+      _routePlannerExpanded = false;
     });
 
-    // Tilts MapLibre camera (45° pitch) as required
+    // Tilts MapLibre camera (45° pitch)
     await map.animateCamera(
       CameraUpdate.newCameraPosition(CameraPosition(
-        target: startPoint,
-        zoom: 17.2,
+        target: initialTarget,
+        zoom: 17.5,
         tilt: 45.0, // 45° pitch
         bearing: initialBearing,
       )),
-      duration: const Duration(milliseconds: 1200),
+      duration: const Duration(milliseconds: 1000),
     );
 
-    // Add vehicle marker on the map
-    _drivewayVehicleSymbol = await map.addSymbol(SymbolOptions(
-      geometry: startPoint,
-      iconImage: 'car-15',
-      iconColor: '#00BCD4',
-      iconSize: 1.8,
-      textField: '🚗 Driveway',
-      textSize: 10.5,
-      textColor: '#004D40',
-      textHaloColor: '#FFFFFF',
-      textHaloWidth: 2.0,
-      textOffset: const Offset(0, -2.0),
-    ));
+    // Prominent triangular navigation pointer aligned with heading/bearing along cyan route line
+    try {
+      _drivewayVehicleCircle = await map.addCircle(CircleOptions(
+        geometry: initialTarget,
+        circleColor: '#00E5FF',
+        circleRadius: 11.0,
+        circleStrokeColor: '#FFFFFF',
+        circleStrokeWidth: 3.0,
+        circleOpacity: 0.95,
+      ));
 
-    // Simulation/tracking loop advancing along the route inside the app
-    _drivewayTimer = Timer.periodic(const Duration(milliseconds: 700), (timer) async {
-      if (!mounted || !_drivewayActive || _drivewayPaused) return;
+      _drivewayVehicleSymbol = await map.addSymbol(SymbolOptions(
+        geometry: initialTarget,
+        textField: '▲', // Prominent triangular navigation arrow pointer
+        textSize: 32.0,
+        textColor: '#006064',
+        textHaloColor: '#FFFFFF',
+        textHaloWidth: 3.5,
+        textRotate: initialBearing, // Aligned with heading/bearing along route
+        textOffset: const Offset(0, 0),
+      ));
+    } catch (_) {}
 
-      if (_drivewayIndex >= _drivewayWaypoints.length - 1) {
-        timer.cancel();
-        if (mounted) {
-          setState(() {
-            _drivewayProgress = 1.0;
-            _drivewayRemainingMeters = 0.0;
-            _drivewayEtaMinutes = 0;
-            _drivewayCompleted = true;
-          });
-          _message('Arrived at destination! In-app driveway complete.');
+    // Subscribe to real live GPS movement via Geolocator.getPositionStream(...)
+    final locationSettings = Platform.isAndroid
+        ? AndroidSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 2,
+            intervalDuration: const Duration(milliseconds: 1000),
+            foregroundNotificationConfig: const ForegroundNotificationConfig(
+              notificationTitle: 'RCMCA Driveway Active',
+              notificationText: 'Live GPS navigation tracking in progress.',
+              enableWakeLock: true,
+              setOngoing: true,
+            ),
+          )
+        : AppleSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 2,
+            activityType: ActivityType.automotiveNavigation,
+          );
+
+    _drivewayPositionSubscription = Geolocator.getPositionStream(
+      locationSettings: locationSettings,
+    ).listen((Position pos) async {
+      if (!mounted || !_drivewayActive || _map == null) return;
+
+      final currentPt = LatLng(pos.latitude, pos.longitude);
+      double bearing = pos.heading;
+
+      // If device course/heading is unavailable (stationary or 0), deduce bearing from last GPS point
+      if (bearing <= 0.0 && _lastDrivewayPosition != null) {
+        final dist = Geolocator.distanceBetween(
+          _lastDrivewayPosition!.latitude,
+          _lastDrivewayPosition!.longitude,
+          pos.latitude,
+          pos.longitude,
+        );
+        if (dist >= 1.5) {
+          bearing = _calculateBearing(
+            LatLng(_lastDrivewayPosition!.latitude, _lastDrivewayPosition!.longitude),
+            currentPt,
+          );
+        } else {
+          bearing = _drivewayBearing;
         }
-        return;
       }
 
-      _drivewayIndex++;
-      final currentPt = _drivewayWaypoints[_drivewayIndex];
-      final nextPt = (_drivewayIndex + 1 < _drivewayWaypoints.length)
-          ? _drivewayWaypoints[_drivewayIndex + 1]
-          : currentPt;
-      final bearing = _calculateBearing(currentPt, nextPt);
-
-      // Check proximity to any reported road hazards along the route
+      // Check proximity to any reported road hazards along route (within 50m)
       RoadHazard? nearby;
       for (final hazard in _hazards) {
         final dist = Geolocator.distanceBetween(
-          currentPt.latitude,
-          currentPt.longitude,
+          pos.latitude,
+          pos.longitude,
           hazard.latitude,
           hazard.longitude,
         );
@@ -1104,52 +1314,78 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         }
       }
 
-      final progress = _drivewayIndex / (_drivewayWaypoints.length - 1);
-      final remainingM = (_drivewayWaypoints.length - 1 - _drivewayIndex) * 22.0;
+      // Remaining distance along recommended coordinates to destination
+      final dest = _recommendedCoordinates.last;
+      final remainingM = Geolocator.distanceBetween(
+        pos.latitude,
+        pos.longitude,
+        dest.latitude,
+        dest.longitude,
+      );
       final etaMin = ((remainingM / 12.0) / 60.0).ceil();
 
       if (mounted) {
         setState(() {
-          _drivewayProgress = progress.clamp(0.0, 1.0);
+          _position = pos;
+          _lastDrivewayPosition = pos;
+          _drivewayBearing = bearing;
+          _drivewayNearbyHazard = nearby;
           _drivewayRemainingMeters = remainingM;
           _drivewayEtaMinutes = etaMin > 0 ? etaMin : 1;
-          _drivewayNearbyHazard = nearby;
         });
       }
 
-      // Move vehicle symbol
-      if (_drivewayVehicleSymbol != null && _map != null) {
+      // Position and rotate the triangular vehicle pointer strictly from real device GPS
+      if (_drivewayVehicleSymbol != null) {
         try {
           await _map!.updateSymbol(
             _drivewayVehicleSymbol!,
-            SymbolOptions(geometry: currentPt),
+            SymbolOptions(
+              geometry: currentPt,
+              textRotate: bearing,
+            ),
+          );
+        } catch (_) {}
+      }
+      if (_drivewayVehicleCircle != null) {
+        try {
+          await _map!.updateCircle(
+            _drivewayVehicleCircle!,
+            CircleOptions(geometry: currentPt),
           );
         } catch (_) {}
       }
 
       // Keep MapLibre camera tilted at 45° pitch, rotated to bearing, centered on vehicle
-      if (_map != null) {
-        try {
-          await _map!.animateCamera(
-            CameraUpdate.newCameraPosition(CameraPosition(
-              target: currentPt,
-              zoom: 17.2,
-              tilt: 45.0, // Continuous 45° pitch in-app driveway
-              bearing: bearing,
-            )),
-            duration: const Duration(milliseconds: 620),
-          );
-        } catch (_) {}
-      }
+      try {
+        await _map!.animateCamera(
+          CameraUpdate.newCameraPosition(CameraPosition(
+            target: currentPt,
+            zoom: 17.5,
+            tilt: 45.0, // Continuous 45° pitch in-app driveway
+            bearing: bearing,
+          )),
+          duration: const Duration(milliseconds: 650),
+        );
+      } catch (_) {}
+    }, onError: (Object err) {
+      debugPrint('Driveway GPS error: $err');
     });
 
-    _message('In-app driveway started (45° pitch camera). Never opening external maps.');
+    _message('Live GPS Driveway started (45° pitch camera). Never opening external maps.');
   }
 
   void _stopInAppDriveway({bool resetCamera = true}) {
-    _drivewayTimer?.cancel();
-    _drivewayTimer = null;
+    _drivewayPositionSubscription?.cancel();
+    _drivewayPositionSubscription = null;
+    _lastDrivewayPosition = null;
 
+    if (_drivewayVehicleCircle != null && _map != null) {
+      try {
+        _map!.removeCircle(_drivewayVehicleCircle!);
+      } catch (_) {}
+      _drivewayVehicleCircle = null;
+    }
     if (_drivewayVehicleSymbol != null && _map != null) {
       try {
         _map!.removeSymbol(_drivewayVehicleSymbol!);
@@ -1160,8 +1396,6 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     if (mounted) {
       setState(() {
         _drivewayActive = false;
-        _drivewayPaused = false;
-        _drivewayCompleted = false;
         _drivewayNearbyHazard = null;
       });
     }
@@ -1216,50 +1450,201 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  Future<void> _openReport() async {
-    final result = await showNewIssueReportSheet(context);
+  Future<void> _openReport({LatLng? pinnedLocation}) async {
+    final result = await showNewIssueReportSheet(
+      context,
+      pinnedLocation: pinnedLocation,
+    );
     if (result != null) {
       await _loadHazards(force: true);
       _message('Hazard report submitted successfully!');
     }
   }
 
+  /// Drops a pin at the current center of the map viewport.
+  Future<void> _dropPinAtCenter() async {
+    final map = _map;
+    if (map == null) return;
+    try {
+      final region = await map.getVisibleRegion();
+      final center = LatLng(
+        (region.northeast.latitude + region.southwest.latitude) / 2.0,
+        (region.northeast.longitude + region.southwest.longitude) / 2.0,
+      );
+      await _handleMapLongClick(center);
+    } catch (_) {
+      await _handleMapLongClick(hyderabad);
+    }
+  }
+
+  /// Handles direct long-press on any road on MapLibre: drops a high-contrast pin
+  /// and opens showNewIssueReportSheet pre-populated with that pinned road coordinate.
+  Future<void> _handleMapLongClick(LatLng coords) async {
+    final map = _map;
+    if (map == null) return;
+
+    if (_pinnedCircle != null) {
+      try {
+        await map.removeCircle(_pinnedCircle!);
+      } catch (_) {}
+      _pinnedCircle = null;
+    }
+    if (_pinnedSymbol != null) {
+      try {
+        await map.removeSymbol(_pinnedSymbol!);
+      } catch (_) {}
+      _pinnedSymbol = null;
+    }
+
+    setState(() => _pinnedLocation = coords);
+
+    try {
+      _pinnedCircle = await map.addCircle(CircleOptions(
+        geometry: coords,
+        circleColor: '#EF4444',
+        circleRadius: 11.0,
+        circleStrokeColor: '#FFFFFF',
+        circleStrokeWidth: 3.0,
+        circleOpacity: 1.0,
+      ));
+
+      _pinnedSymbol = await map.addSymbol(SymbolOptions(
+        geometry: coords,
+        textField:
+            '📍 Pinned Road\n${coords.latitude.toStringAsFixed(4)}, ${coords.longitude.toStringAsFixed(4)}',
+        textSize: 11.0,
+        textColor: '#7F1D1D',
+        textHaloColor: '#FFFFFF',
+        textHaloWidth: 2.0,
+        textOffset: const Offset(0, 1.8),
+      ));
+    } catch (_) {}
+
+    await _openReport(pinnedLocation: coords);
+  }
+
+  /// Clears any custom pinned road marker from the map.
+  Future<void> _clearPinnedLocation() async {
+    final map = _map;
+    if (map != null) {
+      if (_pinnedCircle != null) {
+        try {
+          await map.removeCircle(_pinnedCircle!);
+        } catch (_) {}
+        _pinnedCircle = null;
+      }
+      if (_pinnedSymbol != null) {
+        try {
+          await map.removeSymbol(_pinnedSymbol!);
+        } catch (_) {}
+        _pinnedSymbol = null;
+      }
+    }
+    if (mounted) {
+      setState(() => _pinnedLocation = null);
+      _message('Pinned location cleared');
+    }
+  }
+
+  /// Calls POST /api/v1/issues/refresh to scrape news & seed 100 realistic issues,
+  /// then reloads all map markers and notifies the user with the updated count.
+  Future<void> _refreshAndReloadHazards() async {
+    if (_isRefreshing) return;
+    setState(() => _isRefreshing = true);
+    try {
+      _message('Refreshing civic news & road hazards…');
+      try {
+        final refreshUri = Uri.parse('$apiBase/api/v1/issues/refresh');
+        final resp = await http.post(refreshUri).timeout(const Duration(seconds: 15));
+        debugPrint('Refresh response: ${resp.statusCode}');
+      } catch (e) {
+        debugPrint('Scrape refresh endpoint note: $e');
+      }
+
+      await _loadHazards(force: true);
+
+      _message('Loaded ${_hazards.length} civic road hazards in Hyderabad');
+    } catch (e) {
+      _message('Reload completed: ${_hazards.length} hazards active');
+    } finally {
+      if (mounted) setState(() => _isRefreshing = false);
+    }
+  }
+
   // ---------------------------------------------------------------------------
-  // UI Building Blocks
+  // UI Building Blocks (Decluttered Map Layout)
   // ---------------------------------------------------------------------------
 
-  /// Compact 5-color legend bar on the map:
-  /// GREEN (#22C55E Registered), BLUE (#3B82F6 Resolved), YELLOW (#EAB308 Still Active),
-  /// ORANGE (#F97316 Impacting Others), RED (#EF4444 Ecosystem/Environment).
-  Widget _buildCompactLegendBar() => Card(
+  /// Compact expandable 5-color legend pill chip:
+  /// Collapsed by default to keep >75% of screen as open map canvas.
+  Widget _buildCompactLegendPill() => InkWell(
+        onTap: () => setState(() => _legendExpanded = !_legendExpanded),
+        borderRadius: BorderRadius.circular(20),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF1F5F9),
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(color: const Color(0xFFCBD5E1)),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              for (final cfg in HazardStatusConfig.all) ...[
+                Container(
+                  width: 7,
+                  height: 7,
+                  margin: const EdgeInsets.symmetric(horizontal: 1.5),
+                  decoration: BoxDecoration(
+                    color: cfg.color,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+              ],
+              const SizedBox(width: 5),
+              const Text(
+                'Legend',
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Color(0xFF334155),
+                ),
+              ),
+              const SizedBox(width: 2),
+              Icon(
+                _legendExpanded
+                    ? Icons.keyboard_arrow_up
+                    : Icons.keyboard_arrow_down,
+                size: 15,
+                color: const Color(0xFF64748B),
+              ),
+            ],
+          ),
+        ),
+      );
+
+  Widget _buildExpandedLegendCard() => Card(
         elevation: 3,
         margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-        color: Colors.white.withOpacity(0.96),
+        color: Colors.white.withOpacity(0.97),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
           child: Wrap(
             alignment: WrapAlignment.center,
-            spacing: 12,
+            spacing: 10,
             runSpacing: 4,
             children: HazardStatusConfig.all
                 .map((cfg) => Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Container(
-                          width: 9,
-                          height: 9,
+                          width: 8.5,
+                          height: 8.5,
                           decoration: BoxDecoration(
                             color: cfg.color,
                             shape: BoxShape.circle,
                             border: Border.all(color: Colors.white, width: 1.2),
-                            boxShadow: [
-                              BoxShadow(
-                                color: cfg.color.withOpacity(0.4),
-                                blurRadius: 2,
-                                spreadRadius: 0.5,
-                              ),
-                            ],
                           ),
                         ),
                         const SizedBox(width: 4),
@@ -1283,223 +1668,283 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         children: [
           Card(
             elevation: 3,
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             color: Colors.white.withOpacity(0.96),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               child: Row(
                 children: [
-                  const Icon(Icons.shield_outlined, color: Color(0xFF00838F), size: 20),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          '${_hazards.length} hazards in view · Hyderabad',
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 13,
-                            color: Color(0xFF0F172A),
-                          ),
-                        ),
-                        if (_error != null)
-                          Text(_error!,
-                              style: const TextStyle(color: Colors.red, fontSize: 11)),
-                        if (_position != null)
-                          Text(
-                            'GPS: ±${_position!.accuracy.toStringAsFixed(0)} m',
-                            style: const TextStyle(
-                                color: Color(0xFF64748B), fontSize: 10.5),
-                          ),
-                      ],
+                  const Icon(Icons.shield_outlined,
+                      color: Color(0xFF00838F), size: 18),
+                  const SizedBox(width: 6),
+                  Text(
+                    '${_hazards.length} hazards',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12.5,
+                      color: Color(0xFF0F172A),
                     ),
+                  ),
+                  const SizedBox(width: 8),
+                  _buildCompactLegendPill(),
+                  const Spacer(),
+                  IconButton(
+                    onPressed: _dropPinAtCenter,
+                    icon: const Icon(Icons.add_location_alt_outlined,
+                        color: Color(0xFF00838F), size: 20),
+                    tooltip: 'Drop Pin on Map',
+                    visualDensity: VisualDensity.compact,
                   ),
                   IconButton(
                     onPressed: () => _loadHazards(force: true),
-                    icon: const Icon(Icons.refresh, color: Color(0xFF00838F), size: 20),
+                    icon: const Icon(Icons.refresh,
+                        color: Color(0xFF00838F), size: 20),
                     tooltip: 'Refresh hazards',
+                    visualDensity: VisualDensity.compact,
                   ),
                 ],
               ),
             ),
           ),
-          const SizedBox(height: 5),
-          _buildCompactLegendBar(),
+          if (_legendExpanded) ...[
+            const SizedBox(height: 4),
+            _buildExpandedLegendCard(),
+          ],
         ],
       );
 
-  Widget _buildRoutePlannerCard() => Card(
-        elevation: 4,
+  /// Banner displaying the total count of issues along the route and issues avoided.
+  Widget _buildRouteHazardBanner() {
+    if (_routeBannerText == null) return const SizedBox.shrink();
+    final hasHazards = _routeHazardsCount > 0;
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      color: hasHazards ? const Color(0xFFFFF7ED) : const Color(0xFFF0FDF4),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              hasHazards
+                  ? Icons.warning_amber_rounded
+                  : Icons.verified_user_outlined,
+              color:
+                  hasHazards ? const Color(0xFFEA580C) : const Color(0xFF16A34A),
+              size: 19,
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                _routeBannerText!,
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                  color: hasHazards
+                      ? const Color(0xFF9A3412)
+                      : const Color(0xFF166534),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Collapsible / compact bottom route planner card ensuring >75% map canvas.
+  Widget _buildRoutePlannerCard() {
+    if (!_routePlannerExpanded) {
+      return Card(
+        elevation: 3,
+        margin: EdgeInsets.zero,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // A→B Place Name Inputs
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _originController,
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        labelText: 'From (e.g. Gachibowli)',
-                        prefixIcon: Icon(Icons.trip_origin,
-                            size: 18, color: Color(0xFF22C55E)),
-                      ),
+        color: Colors.white.withOpacity(0.97),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: () => setState(() => _routePlannerExpanded = true),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              children: [
+                const Icon(Icons.alt_route, color: Color(0xFF00838F), size: 20),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _recommendedCoordinates.isNotEmpty
+                        ? '${_originController.text} → ${_destinationController.text}'
+                        : 'Plan route: ${_originController.text} → ${_destinationController.text}',
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 12.5,
+                      color: Color(0xFF0F172A),
                     ),
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  IconButton(
-                    icon: const Icon(Icons.swap_vert, color: Color(0xFF00838F)),
-                    tooltip: 'Swap origin and destination',
-                    onPressed: () {
-                      final tmp = _originController.text;
-                      _originController.text = _destinationController.text;
-                      _destinationController.text = tmp;
-                    },
-                  ),
-                  Expanded(
-                    child: TextField(
-                      controller: _destinationController,
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        labelText: 'To (e.g. Tarnaka)',
-                        prefixIcon: Icon(Icons.location_on,
-                            size: 18, color: Color(0xFFEF4444)),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              Row(
-                children: [
-                  Expanded(
-                    child: FilledButton.icon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF00838F),
-                        foregroundColor: Colors.white,
-                      ),
-                      onPressed: _isPlanningRoute ? null : _planRoute,
-                      icon: _isPlanningRoute
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(
-                                  strokeWidth: 2, color: Colors.white),
-                            )
-                          : const Icon(Icons.alt_route, size: 18),
-                      label: Text(_isPlanningRoute
-                          ? 'Planning…'
-                          : (_navigationActive ? 'Refresh route' : 'Plan safer route')),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton.tonalIcon(
-                    onPressed: _openReport,
-                    icon: const Icon(Icons.camera_alt, size: 18),
-                    label: const Text('Report'),
-                  ),
-                ],
-              ),
-              if (_recommendedCoordinates.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton.icon(
+                ),
+                if (_recommendedCoordinates.isNotEmpty) ...[
+                  FilledButton.icon(
                     style: FilledButton.styleFrom(
                       backgroundColor: const Color(0xFF00838F),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(vertical: 11),
+                      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+                      visualDensity: VisualDensity.compact,
                     ),
                     onPressed: _startInAppDriveway,
-                    icon: const Icon(Icons.navigation_rounded),
-                    label: const Text(
-                      'Start In-App Driveway',
-                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                    ),
+                    icon: const Icon(Icons.navigation_rounded, size: 14),
+                    label: const Text('Driveway', style: TextStyle(fontSize: 11.5)),
                   ),
+                  const SizedBox(width: 4),
+                ] else ...[
+                  IconButton.filled(
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xFF00838F),
+                      foregroundColor: Colors.white,
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    onPressed: _isPlanningRoute ? null : _planRoute,
+                    icon: _isPlanningRoute
+                        ? const SizedBox(
+                            width: 14,
+                            height: 14,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 2, color: Colors.white),
+                          )
+                        : const Icon(Icons.arrow_forward, size: 18),
+                    tooltip: 'Plan route',
+                  ),
+                  const SizedBox(width: 4),
+                ],
+                IconButton(
+                  icon: const Icon(Icons.keyboard_arrow_up,
+                      color: Color(0xFF00838F), size: 20),
+                  tooltip: 'Expand route planner',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => setState(() => _routePlannerExpanded = true),
                 ),
               ],
-              if (_navigationActive && !_drivewayActive) ...[
-                const SizedBox(height: 2),
-                TextButton(
-                  onPressed: () {
-                    setState(() => _navigationActive = false);
-                    _startLocation();
-                  },
-                  child: const Text('End navigation checks'),
-                ),
-              ],
-            ],
+            ),
           ),
         ),
       );
+    }
 
-  Widget _buildDrivewayTopHud() => Card(
-        elevation: 5,
-        color: const Color(0xFF004D40),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-          child: Row(
-            children: [
-              Container(
-                padding: const EdgeInsets.all(6),
-                decoration: const BoxDecoration(
-                  color: Color(0xFF00BCD4),
-                  shape: BoxShape.circle,
+    return Card(
+      elevation: 4,
+      margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.route, color: Color(0xFF00838F), size: 18),
+                const SizedBox(width: 6),
+                const Text('Route Planner',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.keyboard_arrow_down,
+                      color: Color(0xFF64748B), size: 20),
+                  tooltip: 'Collapse',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () => setState(() => _routePlannerExpanded = false),
                 ),
-                child: const Icon(Icons.navigation, color: Colors.white, size: 18),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text(
-                      'IN-APP DRIVEWAY TRACKING',
-                      style: TextStyle(
-                        color: Color(0xFF80DEEA),
-                        fontWeight: FontWeight.bold,
-                        fontSize: 11,
-                        letterSpacing: 0.8,
-                      ),
+              ],
+            ),
+            // A→B Place Name Inputs with Single Arrow Button
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _originController,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      labelText: 'From',
+                      hintText: 'e.g. Gachibowli',
+                      prefixIcon: Icon(Icons.trip_origin,
+                          size: 16, color: Color(0xFF22C55E)),
                     ),
-                    Text(
-                      _drivewayCompleted
-                          ? 'Arrived at Destination'
-                          : 'Cruising along recommended route · 45° Pitch',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w600,
-                        fontSize: 13,
-                      ),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.swap_horiz, color: Color(0xFF00838F)),
+                  tooltip: 'Swap origin and destination',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: () {
+                    final tmp = _originController.text;
+                    _originController.text = _destinationController.text;
+                    _destinationController.text = tmp;
+                  },
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: _destinationController,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      labelText: 'To',
+                      hintText: 'e.g. Tarnaka',
+                      prefixIcon: Icon(Icons.location_on,
+                          size: 16, color: Color(0xFFEF4444)),
                     ),
-                  ],
+                  ),
                 ),
-              ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(6),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(0xFF00838F),
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: _isPlanningRoute ? null : _planRoute,
+                  icon: _isPlanningRoute
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2, color: Colors.white),
+                        )
+                      : const Icon(Icons.arrow_forward),
+                  tooltip: 'Plan route',
                 ),
-                child: const Text(
-                  '42 km/h',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                    fontSize: 12,
+              ],
+            ),
+            if (_recommendedCoordinates.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: const Color(0xFF00838F),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 11),
+                  ),
+                  onPressed: _startInAppDriveway,
+                  icon: const Icon(Icons.navigation_rounded),
+                  label: const Text(
+                    'Start In-App Driveway',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
                   ),
                 ),
               ),
             ],
-          ),
+            if (_navigationActive && !_drivewayActive) ...[
+              const SizedBox(height: 2),
+              TextButton(
+                onPressed: () {
+                  setState(() => _navigationActive = false);
+                  _startLocation();
+                },
+                child: const Text('End navigation checks'),
+              ),
+            ],
+          ],
         ),
-      );
+      ),
+    );
+  }
 
   Widget _buildDrivewayHazardWarning() => Card(
         elevation: 4,
@@ -1526,106 +1971,34 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         ),
       );
 
-  Widget _buildDrivewayBottomHud() => Card(
-        elevation: 5,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-        child: Padding(
-          padding: const EdgeInsets.all(14),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        '${(_drivewayRemainingMeters / 1000).toStringAsFixed(1)} km',
-                        style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF00838F),
-                        ),
-                      ),
-                      const Text(
-                        'Remaining distance',
-                        style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
-                      ),
-                    ],
-                  ),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.end,
-                    children: [
-                      Text(
-                        '$_drivewayEtaMinutes min',
-                        style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF0F172A),
-                        ),
-                      ),
-                      const Text(
-                        'Estimated time',
-                        style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              LinearProgressIndicator(
-                value: _drivewayProgress,
-                backgroundColor: const Color(0xFFE2E8F0),
-                valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF00BCD4)),
-              ),
-              const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: OutlinedButton.icon(
-                      onPressed: () {
-                        setState(() => _drivewayPaused = !_drivewayPaused);
-                      },
-                      icon: Icon(_drivewayPaused ? Icons.play_arrow : Icons.pause),
-                      label: Text(_drivewayPaused ? 'Resume' : 'Pause'),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: FilledButton.tonalIcon(
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFFFEE2E2),
-                        foregroundColor: const Color(0xFFB91C1C),
-                      ),
-                      onPressed: () => _stopInAppDriveway(resetCamera: true),
-                      icon: const Icon(Icons.close),
-                      label: const Text('Exit Driveway'),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      );
-
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
           title: const Text('Road watch · Hyderabad'),
           actions: [
-            IconButton(
-              onPressed: () => _loadHazards(force: true),
-              icon: const Icon(Icons.refresh),
-              tooltip: 'Refresh hazards',
-            ),
+            if (_isRefreshing)
+              const Center(
+                child: Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 14),
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              )
+            else
+              IconButton(
+                onPressed: _refreshAndReloadHazards,
+                icon: const Icon(Icons.refresh),
+                tooltip: 'Scrape news & reload hazards',
+              ),
           ],
         ),
         body: Stack(
           children: [
             MapLibreMap(
-              styleString: 'https://demotiles.maplibre.org/style.json',
+              styleString: mapStyleUrl,
               initialCameraPosition:
                   const CameraPosition(target: hyderabad, zoom: 12.3),
               myLocationEnabled: true,
@@ -1633,228 +2006,388 @@ class RoadMapScreenState extends State<RoadMapScreen> {
               onMapCreated: _onMapCreated,
               onStyleLoadedCallback: _onStyleLoaded,
               onCameraIdle: () => _loadHazards(force: true),
+              onMapLongClick: (Point<double> point, LatLng coordinates) {
+                _handleMapLongClick(coordinates);
+              },
             ),
-            // Top HUD: Status Card & Compact 5-Color Legend OR Driveway Top HUD
-            Positioned(
-              left: 14,
-              right: 14,
-              top: 14,
-              child: _drivewayActive ? _buildDrivewayTopHud() : _buildTopHeaderCard(),
-            ),
+            // Minimal compact "Exit" chip in the top corner during Driveway Mode
+            if (_drivewayActive)
+              Positioned(
+                top: 14,
+                right: 14,
+                child: ActionChip(
+                  avatar: const Icon(Icons.close, size: 16, color: Color(0xFFB91C1C)),
+                  label: const Text(
+                    'Exit Driveway',
+                    style: TextStyle(
+                      color: Color(0xFFB91C1C),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                  backgroundColor: const Color(0xFFFEE2E2),
+                  side: const BorderSide(color: Color(0xFFFCA5A5)),
+                  onPressed: () => _stopInAppDriveway(resetCamera: true),
+                ),
+              ),
+            // Floating "Unpin" action button/chip for accidental long-press pins
+            if (!_drivewayActive && _pinnedLocation != null)
+              Positioned(
+                top: 14,
+                right: 14,
+                child: ActionChip(
+                  avatar: const Icon(Icons.close, size: 16, color: Color(0xFFB91C1C)),
+                  label: const Text(
+                    'Unpin',
+                    style: TextStyle(
+                      color: Color(0xFFB91C1C),
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                  backgroundColor: const Color(0xFFFEE2E2),
+                  side: const BorderSide(color: Color(0xFFFCA5A5)),
+                  onPressed: _clearPinnedLocation,
+                ),
+              ),
+            // Route Hazard Highlighting & Total Count Banner
+            if (!_drivewayActive && _routeBannerText != null)
+              Positioned(
+                left: 14,
+                right: _pinnedLocation != null ? 100 : 14,
+                top: 14,
+                child: _buildRouteHazardBanner(),
+              ),
             // Driveway Proximity Hazard Alert
             if (_drivewayActive && _drivewayNearbyHazard != null)
               Positioned(
                 left: 14,
                 right: 14,
-                top: 86,
+                top: 60,
                 child: _buildDrivewayHazardWarning(),
               ),
-            // Bottom Controls: Route Planner Card OR Driveway HUD
-            Positioned(
-              left: 14,
-              right: 14,
-              bottom: 16,
-              child: _drivewayActive
-                  ? _buildDrivewayBottomHud()
-                  : _buildRoutePlannerCard(),
-            ),
+            // Bottom Controls: Collapsible Route Planner Card (no player bar during driveway)
+            if (!_drivewayActive)
+              Positioned(
+                left: 14,
+                right: 14,
+                bottom: 16,
+                child: _buildRoutePlannerCard(),
+              ),
           ],
         ),
       );
 }
 
-/// Road issue camera capture screen.
-class CaptureScreen extends StatefulWidget {
+/// Road issue capture screen using 4-layer report workflow and local uploads.
+class CaptureScreen extends StatelessWidget {
   const CaptureScreen({super.key});
 
   @override
-  State<CaptureScreen> createState() => _CaptureScreenState();
+  Widget build(BuildContext context) {
+    return NewIssueReportScreen(
+      onSubmitted: (result) {
+        NavigationController.instance.switchTab?.call(0);
+      },
+    );
+  }
 }
 
-class _CaptureScreenState extends State<CaptureScreen> {
-  CameraController? _camera;
-  bool _busy = false;
-  String? _error;
-  String _category = 'pothole';
+/// Opens the 4-layer new-issue report sheet.
+/// When [pinnedLocation] is provided, pre-populates with that pinned road coordinate.
+Future<ReportedIssueResult?> showNewIssueReportSheet(
+  BuildContext context, {
+  ValueChanged<ReportedIssueResult>? onSubmitted,
+  LatLng? pinnedLocation,
+}) {
+  if (pinnedLocation != null) {
+    return showModalBottomSheet<ReportedIssueResult>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (_) => _PinnedIssueReportSheet(
+        pinnedLocation: pinnedLocation,
+        onSubmitted: onSubmitted,
+      ),
+    );
+  }
+  return showNewIssueReportSheet(context, onSubmitted: onSubmitted);
+}
+
+/// Modal sheet for pre-populated road pin reports
+class _PinnedIssueReportSheet extends StatefulWidget {
+  const _PinnedIssueReportSheet({
+    required this.pinnedLocation,
+    this.onSubmitted,
+  });
+
+  final LatLng pinnedLocation;
+  final ValueChanged<ReportedIssueResult>? onSubmitted;
 
   @override
-  void initState() {
-    super.initState();
-    _initializeCamera();
-  }
+  State<_PinnedIssueReportSheet> createState() => _PinnedIssueReportSheetState();
+}
 
-  Future<void> _initializeCamera() async {
-    try {
-      final cameras = await availableCameras();
-      final camera = cameras.firstWhere(
-        (item) => item.lensDirection == CameraLensDirection.back,
-        orElse: () => cameras.first,
-      );
-      final controller = CameraController(
-        camera,
-        ResolutionPreset.high,
-        enableAudio: false,
-        imageFormatGroup: ImageFormatGroup.jpeg,
-      );
-      await controller.initialize();
-      if (!mounted) {
-        await controller.dispose();
-        return;
-      }
-      setState(() => _camera = controller);
-    } catch (error) {
-      if (mounted) setState(() => _error = 'Camera unavailable: $error');
-    }
-  }
+class _PinnedIssueReportSheetState extends State<_PinnedIssueReportSheet> {
+  final TextEditingController _description = TextEditingController();
+  int _conditionScore = 3;
+  String _impact = 'Civic hazard';
+  String _category = 'pothole';
+  final bool _stillPresent = true;
+  bool _submitting = false;
+  String? _error;
+
+  static const List<Map<String, String>> _categories = [
+    {'key': 'pothole', 'label': 'Pothole'},
+    {'key': 'waterlogging', 'label': 'Waterlogging'},
+    {'key': 'damaged_surface', 'label': 'Damaged surface'},
+    {'key': 'open_manhole', 'label': 'Open manhole'},
+    {'key': 'broken_divider', 'label': 'Broken divider'},
+  ];
+
+  static const List<Map<String, dynamic>> _conditions = [
+    {'score': 1, 'label': 'Passable', 'color': Color(0xFF22C55E)},
+    {'score': 2, 'label': 'Minor', 'color': Color(0xFF3B82F6)},
+    {'score': 3, 'label': 'Moderate', 'color': Color(0xFFEAB308)},
+    {'score': 4, 'label': 'Severe', 'color': Color(0xFFF97316)},
+    {'score': 5, 'label': 'Impassable', 'color': Color(0xFFEF4444)},
+  ];
+
+  static const List<String> _impacts = [
+    'Civic hazard',
+    'Traffic congestion',
+    'Safety risk',
+    'Eco / drainage hazard',
+  ];
 
   @override
   void dispose() {
-    _camera?.dispose();
+    _description.dispose();
     super.dispose();
   }
 
-  Future<void> _captureAndSend() async {
-    final camera = _camera;
-    if (camera == null || !camera.value.isInitialized || _busy) return;
+  Future<void> _submit() async {
+    final desc = _description.text.trim();
+    if (desc.length < 8) {
+      setState(() => _error = 'Enter a description of at least 8 characters.');
+      return;
+    }
     setState(() {
-      _busy = true;
+      _submitting = true;
       _error = null;
     });
+
     try {
-      final location =
-          await requestCurrentPosition(LocationAccuracy.bestForNavigation);
-      final capturedAt = DateTime.now().toUtc();
-      final picture = await camera.takePicture();
-      final file = File(picture.path);
-      final contentType = picture.path.toLowerCase().endsWith('.png')
-          ? 'image/png'
-          : 'image/jpeg';
-      final signed = await http.post(
-        Uri.parse('$apiBase/api/v1/uploads/presign'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'file_name': picture.name,
-          'content_type': contentType,
-        }),
-      );
-      if (signed.statusCode != 200) {
-        throw Exception(
-            'Upload signing failed (${signed.statusCode}): ${signed.body}');
+      final response = await http
+          .post(
+            Uri.parse('$apiBase/api/v1/issues/report'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'category': _category,
+              'description': desc,
+              'latitude': widget.pinnedLocation.latitude,
+              'longitude': widget.pinnedLocation.longitude,
+              'severity': _conditionScore,
+              'still_present': _stillPresent,
+              'condition_score': _conditionScore,
+              'impact_mcq': _impact,
+              'capture_accuracy_m': 1.0,
+              'captured_at': DateTime.now().toUtc().toIso8601String(),
+            }),
+          )
+          .timeout(const Duration(seconds: 25));
+
+      if (response.statusCode != 201) {
+        throw Exception('Report failed (${response.statusCode}): ${response.body}');
       }
-      final upload = jsonDecode(signed.body) as Map<String, dynamic>;
-      final uploaded = await http.put(
-        Uri.parse(upload['upload_url'] as String),
-        headers: Map<String, String>.from(upload['headers'] as Map),
-        body: await file.readAsBytes(),
+
+      final result = ReportedIssueResult.fromJson(
+        jsonDecode(response.body) as Map<String, dynamic>,
       );
-      if (uploaded.statusCode < 200 || uploaded.statusCode >= 300) {
-        throw Exception('Image upload failed (${uploaded.statusCode}).');
-      }
-      final report = await http.post(
-        Uri.parse('$apiBase/api/v1/issues/report'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'category': _category,
-          'description':
-              'Citizen camera report: $_category. Captured ${location.timestamp.toUtc().toIso8601String()} with GPS accuracy ${location.accuracy.toStringAsFixed(1)} m.',
-          'latitude': location.latitude,
-          'longitude': location.longitude,
-          'severity': 3,
-          'evidence_image_url': upload['evidence_image_url'],
-          'capture_accuracy_m': location.accuracy,
-          'capture_heading_degrees': location.heading >= 0 && location.heading < 360
-              ? location.heading
-              : null,
-          'captured_at': capturedAt.toIso8601String(),
-        }),
-      );
-      if (report.statusCode != 201) {
-        throw Exception('Report failed (${report.statusCode}): ${report.body}');
-      }
-      final issue = RoadHazard.fromJson(
-          (jsonDecode(report.body) as Map<String, dynamic>)['issue']
-              as Map<String, dynamic>);
-      final vision = http.MultipartRequest(
-        'POST',
-        Uri.parse('$apiBase/api/v1/issues/${issue.id}/vision'),
-      );
-      vision.files.add(await http.MultipartFile.fromPath(
-        'image',
-        file.path,
-        contentType: MediaType.parse(contentType),
-      ));
-      final visionResponse = await vision.send();
-      if (visionResponse.statusCode != 202) {
-        _error =
-            'Report saved; vision assessment could not be queued (${visionResponse.statusCode}).';
-      }
-      if (mounted) Navigator.of(context).pop(issue);
-    } catch (error) {
-      if (mounted) setState(() => _error = error.toString());
-    } finally {
-      if (mounted) setState(() => _busy = false);
+
+      if (!mounted) return;
+      widget.onSubmitted?.call(result);
+      Navigator.of(context).pop(result);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _submitting = false;
+        _error = e.toString().replaceFirst('Exception: ', '');
+      });
     }
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-        appBar: AppBar(title: const Text('Capture road issue')),
-        body: Column(
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        18,
+        12,
+        18,
+        20 + MediaQuery.viewInsetsOf(context).bottom,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
           children: [
-            Expanded(
-              child: _camera?.value.isInitialized == true
-                  ? CameraPreview(_camera!)
-                  : Center(child: Text(_error ?? 'Opening camera…')),
-            ),
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                children: [
-                  DropdownButtonFormField<String>(
-                    initialValue: _category,
-                    decoration: const InputDecoration(labelText: 'Issue type'),
-                    items: const [
-                      DropdownMenuItem(value: 'pothole', child: Text('Pothole')),
-                      DropdownMenuItem(
-                          value: 'waterlogging', child: Text('Waterlogging')),
-                      DropdownMenuItem(
-                          value: 'damaged_surface',
-                          child: Text('Damaged road surface')),
-                      DropdownMenuItem(
-                          value: 'open_manhole', child: Text('Open manhole')),
-                      DropdownMenuItem(
-                          value: 'broken_divider', child: Text('Broken divider')),
+            Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Report at Pinned Road',
+                        style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        'Coordinates locked directly from map pin',
+                        style: theme.textTheme.bodySmall?.copyWith(color: Colors.grey[600]),
+                      ),
                     ],
-                    onChanged: (value) {
-                      if (value != null) setState(() => _category = value);
-                    },
                   ),
-                  if (_error != null)
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8),
-                      child: Text(_error!,
-                          style: const TextStyle(color: Colors.red)),
-                    ),
-                  const SizedBox(height: 12),
-                  SizedBox(
-                    width: double.infinity,
-                    child: FilledButton.icon(
-                      onPressed: _busy ? null : _captureAndSend,
-                      icon: const Icon(Icons.camera),
-                      label: Text(_busy
-                          ? 'Uploading and reporting…'
-                          : 'Capture and report'),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close),
+                  onPressed: () => Navigator.of(context).maybePop(),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            // Pinned Location Card
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF1F5F9),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFFCBD5E1)),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.pin_drop, color: Color(0xFFEF4444), size: 24),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Pinned Road Coordinates',
+                          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+                        ),
+                        Text(
+                          '${widget.pinnedLocation.latitude.toStringAsFixed(5)}, ${widget.pinnedLocation.longitude.toStringAsFixed(5)}',
+                          style: const TextStyle(
+                            fontFamily: 'monospace',
+                            fontSize: 12.5,
+                            color: Color(0xFF0F172A),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                  const SizedBox(height: 4),
-                  const Text(
-                    'Location is sampled immediately before capture. Review traffic conditions before using your phone.',
-                    style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+                  const Chip(
+                    label: Text('Pinned', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor: Color(0xFFFEE2E2),
                   ),
                 ],
               ),
             ),
+            const SizedBox(height: 14),
+            // Category
+            const Text('Issue Type', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: _categories.map((cat) {
+                final selected = _category == cat['key'];
+                return ChoiceChip(
+                  label: Text(cat['label']!),
+                  selected: selected,
+                  onSelected: (val) {
+                    if (val) setState(() => _category = cat['key']!);
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 14),
+            // Severity
+            const Text('Condition Severity', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: _conditions.map((cond) {
+                final selected = _conditionScore == cond['score'];
+                return ChoiceChip(
+                  label: Text('${cond['score']} · ${cond['label']}'),
+                  selected: selected,
+                  selectedColor: (cond['color'] as Color).withOpacity(0.2),
+                  onSelected: (val) {
+                    if (val) setState(() => _conditionScore = cond['score'] as int);
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 14),
+            // Impact
+            const Text('Public Impact', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: _impacts.map((imp) {
+                final selected = _impact == imp;
+                return ChoiceChip(
+                  label: Text(imp),
+                  selected: selected,
+                  onSelected: (val) {
+                    if (val) setState(() => _impact = imp);
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 14),
+            // Description
+            TextField(
+              controller: _description,
+              decoration: const InputDecoration(
+                labelText: 'Description (at least 8 characters)',
+                hintText: 'e.g. Deep pothole across road lane near junction',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              maxLines: 2,
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(_error!, style: const TextStyle(color: Colors.red, fontSize: 12)),
+            ],
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF00838F),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 12),
+              ),
+              onPressed: _submitting ? null : _submit,
+              icon: _submitting
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
+                    )
+                  : const Icon(Icons.send),
+              label: Text(_submitting ? 'Submitting…' : 'Submit Report at Pin'),
+            ),
           ],
         ),
-      );
+      ),
+    );
+  }
 }

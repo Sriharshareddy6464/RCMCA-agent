@@ -23,69 +23,88 @@ class MailAppHandoff {
   static String defaultSubject(Map<String, dynamic> issue) {
     final category = _readableCategory(_text(issue['category']));
     final ward = _text(issue['ward_name']);
-    final location = ward == null ? '' : ' in $ward';
-    return '$category$location — RCMCA issue ${_shortId(issue['id'])}';
+    final location = ward == null ? '' : ' near $ward';
+    return 'Request for field inspection: $category$location '
+        '(RCMCA issue ${_shortId(issue['id'])})';
   }
 
+  /// Composes the narrative complaint letter handed to the mail app.
+  ///
+  /// The letter narrates what was observed, gives the exact coordinates and
+  /// ward details, explains the impact on commuters, and closes with a polite
+  /// request for a field inspection rather than a demand.
   static String defaultBody(Map<String, dynamic> issue) {
     final category = _readableCategory(_text(issue['category']));
     final designation = _text(issue['authority_designation']);
-    final lines = <String>[
-      'Dear ${designation ?? 'Sir/Madam'},',
-      '',
-      'I am reporting a road issue through the RCMCA citizen app and request an inspection.',
-      '',
-      'Issue ID: ${_shortId(issue['id'])}',
-      'Type: $category',
-      'Severity: ${_intValue(issue['severity'])}/5',
-    ];
-
-    final status = _text(issue['status']);
-    if (status != null) lines.add('Status: ${_humanize(status)}');
-
     final ward = _text(issue['ward_name']);
     final corporation = _text(issue['corporation']);
     final zone = _text(issue['zone']);
     final wardNo = issue['ward_no'];
-    final locality = [
+    final latitude = _doubleValue(issue['latitude']);
+    final longitude = _doubleValue(issue['longitude']);
+    final description = _text(issue['description']);
+    final impact = _text(issue['impact_mcq']);
+    final severity = _intValue(issue['severity']);
+    final status = _text(issue['status']);
+    final shortId = _shortId(issue['id']);
+
+    final localityParts = <String>[
       if (ward != null) ward,
       if (corporation != null) corporation,
       if (zone != null) zone,
       if (wardNo != null) 'Ward $wardNo',
-    ].join(' · ');
-    if (locality.isNotEmpty) lines.add('Locality: $locality');
+    ];
+    final locality = localityParts.isEmpty
+        ? 'the location marked on the map'
+        : localityParts.join(', ');
 
-    final latitude = _doubleValue(issue['latitude']);
-    final longitude = _doubleValue(issue['longitude']);
-    if (latitude != null && longitude != null) {
-      lines.add('Location: https://www.google.com/maps/search/?api=1&query=$latitude,$longitude');
-    }
+    final recordDetails = <String>[
+      'issue reference $shortId',
+      if (severity >= 1 && severity <= 5) 'severity $severity of 5',
+      if (status != null) 'recorded as ${_humanize(status).toLowerCase()}',
+    ];
 
-    final impact = _text(issue['impact_mcq']);
-    if (impact != null) lines.add('Reported impact: $impact');
-
-    final description = _text(issue['description']);
-    if (description != null) {
-      lines.addAll(['', 'Description:', description]);
-    }
+    final paragraphs = <String>[
+      'Respected ${designation ?? 'Sir/Madam'},',
+      'I am writing through the RCMCA road safety app to bring to your kind '
+          'notice a road hazard that I observed at $locality. The concern is '
+          'recorded in the ward records as a ${category.toLowerCase()} '
+          '(${recordDetails.join(', ')}).',
+      if (description != null)
+        'What I observed at the spot was this: $description',
+      if (latitude != null && longitude != null)
+        'The exact location is $latitude, $longitude. The pin can be opened '
+        'at https://www.google.com/maps/search/?api=1&query=$latitude,$longitude '
+        'and it was captured by the phone at the time of the report, so it '
+        'should lead the inspection team to the right stretch.',
+      if (impact != null)
+        'The main impact I noticed is ${impact.toLowerCase()}.',
+      'Commuters using this stretch, especially two-wheeler riders and '
+          'pedestrians, have to slow down or change lanes to avoid the hazard. '
+          'This adds to congestion during peak hours and makes the stretch less '
+          'safe after dark and during rain.',
+      'I would be grateful if the ward engineering team could inspect this '
+          'location at a convenient time and take the repair action that the '
+          'site requires. Please let me know if any further information or '
+          'photographs would be helpful, and I will be glad to share them.',
+      'Thank you for your time and for the work your team does to keep the '
+          'city roads safe.',
+      'Respectfully,',
+      'A concerned citizen',
+      'Reporting through the RCMCA road safety app',
+      'Issue reference: $shortId',
+    ];
 
     final photos = _imageUrls(issue);
     if (photos.isNotEmpty) {
-      lines.addAll(['', 'Photos:']);
-      for (final url in photos.take(4)) {
-        lines.add('- $url');
-      }
+      paragraphs.insert(
+        paragraphs.length - 4,
+        'Photographs submitted with this report:\n'
+            '${photos.take(4).map((url) => '- $url').join('\n')}',
+      );
     }
 
-    lines.addAll([
-      '',
-      'Please inspect this location and arrange repairs at the earliest.',
-      '',
-      'Regards,',
-      'A concerned citizen',
-      '(Sent from the RCMCA road safety app)',
-    ]);
-    return lines.join('\n');
+    return paragraphs.join('\n\n');
   }
 
   /// Opens `mailto:` with the recipient, subject, and body already filled in.
@@ -134,9 +153,10 @@ class MailAppHandoff {
 
 /// Opens the issue detail sheet used by the chat tab and by issue pins.
 ///
-/// When [draftTo], [draftSubject], or [draftBody] are supplied (the chat API's
-/// `draft_email`), the mail button reuses that draft. Otherwise a complaint is
-/// composed from the issue's own fields, including `authority_email`.
+/// When [draftTo] or [draftSubject] are supplied (from the chat API's
+/// `draft_email`), the mail button reuses that recipient and subject. The body
+/// is always composed from the issue's own fields with the narrative template,
+/// so the exact location and ward details are never lost.
 Future<void> showIssueDetailSheet(
   BuildContext context, {
   required Map<String, dynamic> issue,
@@ -170,6 +190,10 @@ class IssueDetailSheet extends StatefulWidget {
   final Map<String, dynamic> issue;
   final String? draftTo;
   final String? draftSubject;
+
+  /// Optional body from a caller. Kept for API compatibility; [MailAppHandoff]
+  /// prefers the narrative template so the letter always carries the exact
+  /// location, ward details, and commuter impact.
   final String? draftBody;
 
   @override
@@ -207,12 +231,11 @@ class _IssueDetailSheetState extends State<IssueDetailSheet> {
           widget.draftSubject,
           MailAppHandoff.defaultSubject(widget.issue),
         ]) ??
-        'Road issue complaint';
-    final body = _firstNonEmpty([
-          widget.draftBody,
-          MailAppHandoff.defaultBody(widget.issue),
-        ]) ??
-        MailAppHandoff.defaultBody(widget.issue);
+        'Request for field inspection';
+    // Always send the structured narrative so the letter carries the exact
+    // location, ward details, and commuter impact, even when the chat API
+    // returned a shorter draft.
+    final body = MailAppHandoff.defaultBody(widget.issue);
     await MailAppHandoff.sendWithFeedback(
       context,
       to: recipient,
@@ -272,6 +295,18 @@ class _IssueDetailSheetState extends State<IssueDetailSheet> {
     final authorityEmail = _text(widget.issue['authority_email']);
     final created = _formatTimestamp(widget.issue['created_at']);
     final updated = _formatTimestamp(widget.issue['updated_at']);
+
+    final rawSourceUrl = _text(widget.issue['source_url']);
+    String? sourceUrl;
+    if (rawSourceUrl != null &&
+        (rawSourceUrl.startsWith('http://') || rawSourceUrl.startsWith('https://'))) {
+      sourceUrl = rawSourceUrl;
+    } else if (description != null) {
+      final match = RegExp(r'https?://[^\s)]+').firstMatch(description);
+      if (match != null) {
+        sourceUrl = match.group(0);
+      }
+    }
 
     return ConstrainedBox(
       constraints: BoxConstraints(
@@ -492,8 +527,8 @@ class _IssueDetailSheetState extends State<IssueDetailSheet> {
             if (recipient != null) ...[
               const SizedBox(height: 6),
               Text(
-                'Opens Gmail (or your default mail app) with the recipient, '
-                'subject, and complaint body pre-filled.',
+                'Opens Gmail (or your default mail app) with the recipient and '
+                'a narrative complaint letter already filled in.',
                 textAlign: TextAlign.center,
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: scheme.onSurfaceVariant),
@@ -507,6 +542,47 @@ class _IssueDetailSheetState extends State<IssueDetailSheet> {
                 label: const Text('Verify condition here'),
                 style: OutlinedButton.styleFrom(
                   padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+              ),
+            ],
+            if (sourceUrl != null && sourceUrl.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Material(
+                color: Colors.transparent,
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(16),
+                  onTap: () async {
+                    final uri = Uri.tryParse(sourceUrl!);
+                    if (uri != null) {
+                      await launchUrl(uri, mode: LaunchMode.externalApplication);
+                    }
+                  },
+                  child: _card(
+                    child: Row(
+                      children: [
+                        Icon(Icons.newspaper, size: 20, color: scheme.primary),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              _cardTitle('Source News / Blog Article'),
+                              const SizedBox(height: 3),
+                              Text(
+                                'Read Source News / Blog Article',
+                                style: TextStyle(
+                                  color: scheme.primary,
+                                  fontWeight: FontWeight.w600,
+                                  decoration: TextDecoration.underline,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Icon(Icons.open_in_new, size: 18, color: scheme.primary),
+                      ],
+                    ),
+                  ),
                 ),
               ),
             ],

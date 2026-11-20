@@ -287,12 +287,18 @@ class _ChatScreenState extends State<ChatScreen> {
           reply.draftEmail?.subject,
           if (issue != null) MailAppHandoff.defaultSubject(issue),
         ]) ??
-        'Road issue complaint';
-    final body = _firstNonEmpty([
-          reply.draftEmail?.body,
-          if (issue != null) MailAppHandoff.defaultBody(issue),
-        ]) ??
-        'Reporting a road issue through the RCMCA app.';
+        'Request for field inspection';
+    // Prefer the narrative template whenever the issue is known, so the letter
+    // always narrates the hazard, exact location, ward details, and commuter
+    // impact, and closes with a polite request for a field inspection.
+    final body = issue != null
+        ? MailAppHandoff.defaultBody(issue)
+        : (_firstNonEmpty([reply.draftEmail?.body]) ??
+            'Respected Sir/Madam,\n\n'
+                'I am writing through the RCMCA road safety app to report a '
+                'road hazard near my location and to request a field '
+                'inspection at a convenient time.\n\n'
+                'Respectfully,\nA concerned citizen');
     await MailAppHandoff.sendWithFeedback(
       context,
       to: recipient,
@@ -494,7 +500,6 @@ class _ChatScreenState extends State<ChatScreen> {
           issue: issue,
           draftTo: reply.draftEmail?.to,
           draftSubject: reply.draftEmail?.subject,
-          draftBody: reply.draftEmail?.body,
         ),
         child: Container(
           padding: const EdgeInsets.all(12),
