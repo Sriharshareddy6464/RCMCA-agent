@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 
 from rcmc_graph import ChatIntent, build_chat_graph
+from ..services.geocoding import find_hyderabad_locality
 
 router = APIRouter(tags=["chat"])
 
@@ -49,9 +50,18 @@ async def _audit_from_chat(intent: ChatIntent, state: dict[str, Any], request: R
 
 
 def _issue_search_terms(value: str) -> str:
-    stopwords = {"road", "issue", "reported", "problem", "near", "at", "the", "on", "in", "my"}
+    stopwords = {
+        "a", "an", "any", "are", "is", "road", "issue", "issues", "reported",
+        "problem", "problems", "near", "at", "the", "on", "in", "my", "there",
+        "please", "find", "show", "me", "about", "of", "for", "to", "by",
+    }
+    plurals = {
+        "potholes": "pothole", "manholes": "manhole", "cracks": "crack",
+        "issues": "issue", "problems": "problem", "drains": "drain",
+    }
     words = re.findall(r"\w+", value.casefold())
-    return " ".join(word for word in words if len(word) >= 3 and word not in stopwords)
+    normalized = [plurals.get(word, word) for word in words]
+    return " ".join(word for word in normalized if len(word) >= 3 and word not in stopwords)
 
 
 async def _resolve_issue(intent: ChatIntent, state: dict[str, Any], request: Request):
@@ -66,7 +76,7 @@ async def _resolve_issue(intent: ChatIntent, state: dict[str, Any], request: Req
 
     fields = """
         id::text AS id, category::text AS category, severity,
-        description, status::text AS status, status_color,
+        description, status::text AS status, status_color, impact_mcq,
         corporation, zone, ward_no, ward_name,
         authority_designation, authority_email,
         ST_Y(location::geometry) AS latitude,
@@ -83,10 +93,40 @@ async def _resolve_issue(intent: ChatIntent, state: dict[str, Any], request: Req
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail="The issue ID is not a valid UUID") from exc
         else:
-            query_text = _issue_search_terms(intent.issue_query or state["message"])
+            full_query = " ".join(part for part in (intent.issue_query, state["message"]) if part)
+            query_text = _issue_search_terms(full_query)
+            locality = find_hyderabad_locality(full_query)
+            category = next(
+                (name for name in (
+                    "pothole", "waterlogging", "damaged_surface", "open_manhole",
+                    "broken_divider", "other",
+                ) if name.replace("_", " ") in query_text),
+                None,
+            )
+            if locality:
+                row = await connection.fetchrow(
+                    f"""
+                    SELECT {fields},
+                           ST_Distance(
+                               location::geography,
+                               ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography
+                           ) AS distance_m
+                    FROM road_issues
+                    WHERE status <> 'resolved'
+                      AND ($3::text IS NULL OR category::text = $3)
+                      AND ST_DWithin(
+                          location::geography,
+                          ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
+                          3000
+                      )
+                    ORDER BY distance_m ASC, severity DESC, updated_at DESC
+                    LIMIT 1
+                    """,
+                    locality["longitude"], locality["latitude"], category,
+                )
             if query_text:
                 ts_query = " | ".join(f"{word}:*" for word in query_text.split())
-                row = await connection.fetchrow(
+                row = row or await connection.fetchrow(
                     f"""
                     SELECT {fields},
                            ts_rank(
@@ -117,7 +157,7 @@ async def _resolve_issue(intent: ChatIntent, state: dict[str, Any], request: Req
                       AND ST_DWithin(
                           location::geography,
                           ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography,
-                          2000
+                          3000
                       )
                     ORDER BY distance_m ASC
                     LIMIT 1
@@ -154,9 +194,14 @@ def _route_explanation(audit: dict[str, Any]) -> str:
     origin = audit["origin"].get("display_name", "the requested origin")
     destination = audit["destination"].get("display_name", "the requested destination")
     routes = audit["routes"]
+    using_fallback = audit.get("routing_source") == "fallback_geometry"
     lines = [
         f"1. Route endpoints: {origin} to {destination}.",
-        f"2. OSRM evaluated {len(routes)} driving plan(s).",
+        (
+            f"2. OSRM evaluated {len(routes)} driving plan(s)."
+            if not using_fallback
+            else f"2. The routing engine was unavailable; I generated {len(routes)} approximate corridor option(s)."
+        ),
         "3. I checked each plan's 40 m corridor against active PostGIS road issues:",
     ]
     for route in routes:

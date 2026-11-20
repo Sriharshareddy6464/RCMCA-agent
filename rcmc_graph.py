@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import os
 import json
+import asyncio
+import logging
+import re
 from typing import Any, Awaitable, Callable, Literal, TypedDict
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 HazardCategory = Literal[
     "pothole",
@@ -76,6 +81,177 @@ class ChatState(TypedDict, total=False):
     issue: dict[str, Any]
     email_draft: ComplaintDraft
     answer: str
+    llm_fallback: bool
+
+
+def deterministic_chat_intent(message: str, user_lat=None, user_lon=None) -> ChatIntent:
+    """Extract route or issue intent without calling an LLM."""
+    text = " ".join(message.strip().split())
+    folded = text.casefold()
+    language: Literal["en", "te", "hi"] = "en"
+    if re.search(r"[\u0c00-\u0c7f]", text):
+        language = "te"
+    elif re.search(r"[\u0900-\u097f]", text):
+        language = "hi"
+
+    issue_match = re.search(
+        r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        text,
+    )
+    pair = re.search(
+        r"\bfrom\s+(?P<origin>.+?)\s+to\s+(?P<destination>.+?)(?=$|[?.!,;])",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if pair is None:
+        pair = re.search(
+            r"\bbetween\s+(?P<origin>.+?)\s+and\s+(?P<destination>.+?)(?=$|[?.!,;])",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if pair is None:
+        pair = re.search(
+            r"(?P<origin>.+?)\s+से\s+(?P<destination>.+?)\s+तक(?=$|[?.!,;])",
+            text,
+        )
+    if pair is None:
+        pair = re.search(
+            r"(?P<origin>.+?)\s+(?:నుంచి|నుండి)\s+(?P<destination>.+?)\s+వరకు(?=$|[?.!,;])",
+            text,
+        )
+
+    route_request = bool(
+        pair
+        or re.search(
+            r"\b(route|navigate|navigation|travel|drive|driving|directions|commute|destination|go to|get to|"
+            r"रास्ता|मार्ग|सड़क|जाना|जाऊं|जाएँ|"
+            r"మార్గం|రోడ్డు|వెళ్లాలి|వెళ్ళాలి|వెళ్లడానికి|వెళ్ళడానికి)\b",
+            folded,
+        )
+    )
+    if route_request:
+        origin = pair.group("origin").strip() if pair else None
+        destination = pair.group("destination").strip() if pair else None
+        if pair is None:
+            single_destination = re.search(
+                r"\b(?:plan\s+(?:a\s+)?route|route|navigate|navigation|travel|drive|directions|go|get|take\s+me)"
+                r"\s+(?:me\s+)?(?:to|towards)\s+(?P<destination>.+?)(?=$|[?.!,;])",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if single_destination:
+                destination = single_destination.group("destination").strip()
+        if destination:
+            destination = re.split(
+                r"\b(?:are there any|is there any|any issues?|on the way|in the way|"
+                r"avoiding|without|via|please|safest route)\b",
+                destination,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" .,!?:;")
+        if origin and re.fullmatch(
+            r"(?:my\s+)?(?:current\s+location|location|here|मेरी\s+लोकेशन|मेरी\s+जगह)",
+            origin,
+            flags=re.IGNORECASE,
+        ):
+            origin = "current location"
+        elif not origin and user_lat is not None and user_lon is not None:
+            origin = "current location"
+        return ChatIntent(
+            action="route",
+            origin=origin or None,
+            destination=destination or None,
+            issue_id=None,
+            issue_query=None,
+            language=language,
+        )
+
+    issue_request = bool(
+        issue_match
+        or re.search(
+            r"\b(issue|complaint|inspection|inspect|potholes?|waterlog(?:ging)?|"
+            r"manholes?|damaged road|road condition|hazard|repair|sewage|cracks?|"
+            r"शिकायत|समस्या|गड्ढा|जलभराव|निरीक्षण|सड़क|नाला|"
+            r"ఫిర్యాదు|సమస్య|గుంత|నీరు నిల్వ|పరిశీలన|రహదారి|కాలువ)\b",
+            folded,
+        )
+    )
+    if issue_request:
+        query = re.sub(
+            r"\b(?:can you|could you|would you|please|send|draft|write|file|"
+            r"submit|raise|make|about|tell me about|what is|what's|status of|"
+            r"inspection|inspect|complaint|issue|reported|report|road|near|at|the|"
+            r"in|on|for|email|mail)\b",
+            " ",
+            folded,
+            flags=re.IGNORECASE,
+        )
+        if issue_match:
+            query = query.replace(issue_match.group(0).casefold(), " ")
+        query = re.sub(r"[^\w\s-]", " ", query)
+        query = " ".join(query.split())
+        return ChatIntent(
+            action="issue",
+            issue_id=issue_match.group(0) if issue_match else None,
+            issue_query=query or None,
+            language=language,
+        )
+
+    return ChatIntent(action="other", language=language)
+
+
+def deterministic_issue_email(issue: dict[str, Any], language: str = "en") -> ComplaintDraft:
+    """Create a fact-bound inspection email when the configured LLM is offline."""
+    category = str(issue.get("category") or "road issue")
+    ward = str(issue.get("ward_name") or "unassigned ward")
+    corporation = str(issue.get("corporation") or "municipal corporation not recorded")
+    designation = str(issue.get("authority_designation") or "Municipal Road Inspection Team")
+    status = str(issue.get("status") or "status not recorded")
+    description = str(issue.get("description") or category)
+    latitude = issue.get("latitude")
+    longitude = issue.get("longitude")
+    coordinates = (
+        f"{float(latitude):.6f}, {float(longitude):.6f}"
+        if latitude is not None and longitude is not None
+        else "not recorded in the issue record"
+    )
+    zone = str(issue.get("zone") or "zone not recorded")
+    impact = str(issue.get("impact_mcq") or "commuter impact not recorded")
+    subject = f"Road inspection request: {category} - {ward}"[:120]
+
+    if language == "te":
+        subject = f"రోడ్డు పరిశీలన అభ్యర్థన: {category} - {ward}"[:120]
+        body = (
+            f"గౌరవనీయులైన {designation} గారికి,\n\n"
+            f"{ward} వార్డులో నమోదైన {category} సమస్య గురించి తెలియజేస్తున్నాను. "
+            f"నమోదైన రహదారి పరిస్థితి: {description}\nఖచ్చితమైన coordinates (latitude, longitude): {coordinates}\n"
+            f"వార్డు: {ward}; జోన్: {zone}; కార్పొరేషన్: {corporation}\n"
+            f"ప్రయాణికులపై నమోదైన ప్రభావం: {impact}\nప్రస్తుత నమోదు స్థితి: {status}\n\n"
+            "దయచేసి సౌకర్యమైన సమయంలో సిబ్బందిని పంపి స్థలాన్ని పరిశీలించి, అవసరమైతే తగిన చర్యను పరిగణించగలరు. ధన్యవాదాలు."
+        )
+    elif language == "hi":
+        subject = f"सड़क निरीक्षण अनुरोध: {category} - {ward}"[:120]
+        body = (
+            f"आदरणीय {designation},\n\n"
+            f"{ward} वार्ड में दर्ज {category} समस्या के बारे में सूचित करना चाहता/चाहती हूँ। "
+            f"दर्ज सड़क की स्थिति: {description}\nसटीक निर्देशांक (अक्षांश, देशांतर): {coordinates}\n"
+            f"वार्ड: {ward}; ज़ोन: {zone}; नगर निगम: {corporation}\n"
+            f"आवागमन पर दर्ज प्रभाव: {impact}\nदर्ज वर्तमान स्थिति: {status}\n\n"
+            "कृपया सुविधा अनुसार क्षेत्र का निरीक्षण करने के लिए कर्मचारियों को भेजने और आवश्यक कार्रवाई पर विचार करने का कष्ट करें। धन्यवाद।"
+        )
+    else:
+        body = (
+            f"Dear {designation},\n\n"
+            f"I am writing to bring a recorded {category} road condition to your attention.\n"
+            f"Observed/recorded condition: {description}\n"
+            f"Exact recorded coordinates (latitude, longitude): {coordinates}\n"
+            f"Ward: {ward}; zone: {zone}; corporation: {corporation}\n"
+            f"Recorded commuter impact: {impact}\nCurrent recorded status: {status}\n\n"
+            "When convenient, could your team please arrange a field inspection and consider any "
+            "appropriate action? This request is based on the issue record and does not imply "
+            "that an official inspection has already taken place. Thank you for your attention."
+        )
+    return ComplaintDraft(subject=subject, body=body[:1500])
 
 
 def _model():
@@ -195,40 +371,65 @@ def build_chat_graph(
     The model extracts intent and drafts issue correspondence. Route scoring and
     issue lookup remain application/PostGIS operations supplied by the API.
     """
-    llm = chat_model or _model()
-    intent_llm = llm.with_structured_output(ChatIntent)
-    email_llm = llm.with_structured_output(ComplaintDraft)
+    try:
+        llm = chat_model or _model()
+        intent_llm = llm.with_structured_output(ChatIntent)
+        email_llm = llm.with_structured_output(ComplaintDraft)
+    except Exception as exc:
+        # Client construction/structured-output setup must not disable the
+        # deterministic route and issue tools.
+        logger.warning("Chat model setup failed; using deterministic fallback (%s)", type(exc).__name__)
+        intent_llm = None
+        email_llm = None
+    try:
+        model_timeout = max(0.1, float(os.getenv("CHAT_LLM_TIMEOUT_SECONDS", "4")))
+    except ValueError:
+        model_timeout = 4.0
 
     async def interpret_message(state: ChatState) -> dict[str, Any]:
-        intent = await intent_llm.ainvoke(
-            [
-                (
-                    "system",
-                    "Classify the user's Hyderabad road-monitoring request. Use action=route "
-                    "when they ask to travel, navigate, compare a route, or go from one "
-                    "place to another. Extract origin and destination as concise place names; "
-                    "if they say 'here', 'from my location', or equivalent, set origin to "
-                    "'current location'. Use action=issue when they ask about a reported road "
-                    "issue or want an inspection/repair complaint; preserve any UUID and "
-                    "extract a short category/locality search phrase. Otherwise use action=other. "
-                    "Never invent a place name or issue ID. Set language to en, te, or hi.",
-                ),
-                (
-                    "human",
-                    json.dumps(
-                        {
-                            "message": state["message"],
-                            "user_location": {
-                                "latitude": state.get("user_lat"),
-                                "longitude": state.get("user_lon"),
-                            },
-                        },
-                        ensure_ascii=False,
+        if intent_llm is not None:
+            try:
+                intent = await asyncio.wait_for(
+                    intent_llm.ainvoke(
+                        [
+                            (
+                                "system",
+                                "Classify the user's Hyderabad road-monitoring request. Use action=route "
+                                "when they ask to travel, navigate, compare a route, or go from one "
+                                "place to another. Extract origin and destination as concise place names; "
+                                "if they say 'here', 'from my location', or equivalent, set origin to "
+                                "'current location'. Use action=issue when they ask about a reported road "
+                                "issue or want an inspection/repair complaint; preserve any UUID and "
+                                "extract a short category/locality search phrase. Otherwise use action=other. "
+                                "Never invent a place name or issue ID. Set language to en, te, or hi.",
+                            ),
+                            (
+                                "human",
+                                json.dumps(
+                                    {
+                                        "message": state["message"],
+                                        "user_location": {
+                                            "latitude": state.get("user_lat"),
+                                            "longitude": state.get("user_lon"),
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        ]
                     ),
-                ),
-            ]
+                    timeout=model_timeout,
+                )
+                return {"intent": ChatIntent.model_validate(intent), "llm_fallback": False}
+            except Exception as exc:
+                logger.warning(
+                    "Chat intent model unavailable; using deterministic extraction (%s)",
+                    type(exc).__name__,
+                )
+        intent = deterministic_chat_intent(
+            state["message"], state.get("user_lat"), state.get("user_lon")
         )
-        return {"intent": ChatIntent.model_validate(intent)}
+        return {"intent": intent, "llm_fallback": True}
 
     async def run_route_audit(state: ChatState) -> dict[str, Any]:
         intent = state["intent"]
@@ -238,28 +439,45 @@ def build_chat_graph(
     async def find_issue_and_draft_email(state: ChatState) -> dict[str, Any]:
         intent = state["intent"]
         issue = await issue_resolver(intent, state)
-        email = await email_llm.ainvoke(
-            [
-                (
-                    "system",
-                    "Draft a concise, respectful municipal inspection/repair email using "
-                    "only the supplied database issue record. Do not invent a date, street, "
-                    "impact, repair history, or official finding. Include the recorded issue "
-                    "description, ward, corporation, status, and a request to inspect and take "
-                    "appropriate action. Write in the requested language (en=English, "
-                    "te=Telugu, hi=Hindi). This is a draft only; do not claim it was sent.",
-                ),
-                (
-                    "human",
-                    json.dumps(
-                        {"language": intent.language, "issue": issue},
-                        ensure_ascii=False,
-                        default=str,
+        if email_llm is not None and not state.get("llm_fallback", False):
+            try:
+                email = await asyncio.wait_for(
+                    email_llm.ainvoke(
+                        [
+                            (
+                                "system",
+                                "Draft a polite, structured citizen-to-authority email using "
+                                "only the supplied database issue record. Do not invent a date, street, "
+                                "impact, repair history, or official finding. Narrate the recorded road "
+                                "condition, exact coordinates, ward and zone, corporation, recorded commuter "
+                                "impact, and status. Respectfully request a field inspection and, if appropriate, "
+                                "follow-up action without demanding it. Write in the requested language (en=English, "
+                                "te=Telugu, hi=Hindi). This is a draft only; do not claim it was sent.",
+                            ),
+                            (
+                                "human",
+                                json.dumps(
+                                    {"language": intent.language, "issue": issue},
+                                    ensure_ascii=False,
+                                    default=str,
+                                ),
+                            ),
+                        ]
                     ),
-                ),
-            ]
-        )
-        return {"issue": issue, "email_draft": ComplaintDraft.model_validate(email)}
+                    timeout=model_timeout,
+                )
+                draft = ComplaintDraft.model_validate(email)
+                return {"issue": issue, "email_draft": draft}
+            except Exception as exc:
+                logger.warning(
+                    "Chat email model unavailable; using deterministic draft (%s)",
+                    type(exc).__name__,
+                )
+        return {
+            "issue": issue,
+            "email_draft": deterministic_issue_email(issue, intent.language),
+            "llm_fallback": True,
+        }
 
     def other_response(_state: ChatState) -> dict[str, str]:
         return {
