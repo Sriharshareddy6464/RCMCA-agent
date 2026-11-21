@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import secrets
+import time
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
@@ -20,6 +25,11 @@ from ..schemas import (
 from ..scrape_hyd_civic import scrape_feeds
 
 router = APIRouter(prefix="/api/v1/issues", tags=["issues"])
+logger = logging.getLogger(__name__)
+_REFRESH_COOLDOWN_SECONDS = 60
+_refresh_lock = asyncio.Lock()
+_refresh_completed_at: float | None = None
+_refresh_cached_counts = {"imported": 0, "total_issues": 0}
 
 ISSUE_FIELDS_X = (
     ISSUE_FIELDS.rstrip()
@@ -78,16 +88,44 @@ async def list_issues(request: Request, south: float, west: float, north: float,
 @router.post("/refresh")
 async def refresh_issues(request: Request):
     """Refresh public civic news and ensure the Hyderabad demo issue set exists."""
-    pool = request.app.state.db
-    # Seed first so a public feed outage never prevents the map from having a
-    # complete local issue set. This is idempotent and also runs at startup.
-    async with pool.acquire() as connection:
-        await ensure_hyd_demo_issues(connection)
+    global _refresh_completed_at, _refresh_cached_counts
 
-    imported = await scrape_feeds(pool)
-    async with pool.acquire() as connection:
-        total_issues = await connection.fetchval("SELECT COUNT(*) FROM road_issues")
-    return {"imported": imported, "total_issues": int(total_issues or 0)}
+    expected_token = os.getenv("REFRESH_API_TOKEN", "").strip()
+    supplied_token = request.headers.get("X-Refresh-Token", "")
+    authorized_refresh = False
+    if expected_token:
+        if not secrets.compare_digest(expected_token, supplied_token):
+            raise HTTPException(status_code=401, detail="A valid X-Refresh-Token is required")
+        authorized_refresh = True
+
+    pool = request.app.state.db
+    async with _refresh_lock:
+        now = time.monotonic()
+        if (
+            not authorized_refresh
+            and _refresh_completed_at is not None
+            and now - _refresh_completed_at < _REFRESH_COOLDOWN_SECONDS
+        ):
+            return dict(_refresh_cached_counts)
+
+        # Seed first so a public feed outage never prevents the map from having
+        # a complete local issue set. This is idempotent and also runs at startup.
+        async with pool.acquire() as connection:
+            await ensure_hyd_demo_issues(connection)
+
+        try:
+            imported = await scrape_feeds(pool)
+        except Exception as exc:
+            logger.warning("Civic news refresh failed (%s)", type(exc).__name__)
+            imported = 0
+        async with pool.acquire() as connection:
+            total_issues = await connection.fetchval("SELECT COUNT(*) FROM road_issues")
+        _refresh_cached_counts = {
+            "imported": int(imported or 0),
+            "total_issues": int(total_issues or 0),
+        }
+        _refresh_completed_at = time.monotonic()
+        return dict(_refresh_cached_counts)
 
 
 async def _evidence_for_issue(connection, issue_id: UUID) -> list[dict]:

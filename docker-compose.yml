@@ -47,6 +47,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres_dev_only@postgis:5432/road_intelligence}
       REDIS_URL: redis://redis:6379/0
       OSRM_URL: http://osrm:5000
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      DEMO_BASE_EMAIL: ${DEMO_BASE_EMAIL:-}
+      HYD_CIVIC_RSS_URLS: ${HYD_CIVIC_RSS_URLS:-}
+      GEOCODER_BASE_URL: ${GEOCODER_BASE_URL:-https://nominatim.openstreetmap.org}
+      REFRESH_API_TOKEN: ${REFRESH_API_TOKEN:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai_compatible}
       AWS_REGION: ${AWS_REGION:-ap-south-1}
       S3_BUCKET: ${S3_BUCKET:-}
@@ -63,6 +68,7 @@ services:
       VISION_SEVERITY_AREA_THRESHOLDS: ${VISION_SEVERITY_AREA_THRESHOLDS:-0.01,0.03,0.08,0.2}
     volumes:
       - ./models:/models:ro
+      - uploads_data:/app/uploads
     depends_on:
       postgis:
         condition: service_healthy
@@ -140,3 +146,4 @@ volumes:
   postgis_data:
   redis_data:
   huggingface_cache:
+  uploads_data:
