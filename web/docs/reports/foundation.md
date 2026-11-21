@@ -26,3 +26,14 @@
 ## Requests
 
 None.
+
+## Verification
+
+- `npm ci && npm run build`: passed; Vite 8.3.8 emitted a production bundle.
+- `npx tsc --noEmit`: passed with no diagnostics.
+- All 12 requested skeleton paths exist.
+- Production GET `/health`: HTTP 200, `{"status":"ok"}`. GET issue list and detail: HTTP 200. Vision status sample: HTTP 404 for the unknown test UUID. Brief-only `/api/v1/issues/nearby`: HTTP 422.
+- No production POST requests were sent.
+- Commits: `a89c10d`, `807bda3`, `1898c57`, `80a67c2`.
+- The local checkout has no `web/integration` branch, so the exact `git diff --name-only web/integration...HEAD` handoff check cannot run. The committed foundation files are confined to `web/`; user reference-image renames/deletions remain unstaged.
+- `npm ci` reports one high severity dependency audit finding. No audit fix was applied during foundation setup.
