@@ -1,0 +1,15 @@
+# Copy this file to mobile/android/key.properties and fill in your release
+# keystore details. key.properties is git-ignored: never commit it, the
+# passwords, or the keystore itself.
+#
+# While key.properties is absent, release builds fall back to the debug signing
+# config so local and CI builds keep working without secrets.
+#
+# storeFile is resolved relative to mobile/android/app/ unless it is absolute,
+# so a keystore stored next to this file (mobile/android/rcmca-release.jks)
+# becomes "../rcmca-release.jks". An absolute path also works and is what CI
+# typically writes.
+storeFile=../rcmca-release.jks
+storePassword=change-me
+keyAlias=rcmca
+keyPassword=change-me

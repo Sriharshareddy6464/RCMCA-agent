@@ -4,6 +4,8 @@
 <dict>
 	<key>NSCameraUsageDescription</key>
 	<string>Take a road photo to report a pothole or other hazard.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Select evidence photos from your library to attach to a road hazard report.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>Attach the road issue location and show nearby hazards while using the app.</string>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
@@ -19,7 +21,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>Rcmca Mobile</string>
+	<string>RCMCA Road Watch</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -34,8 +36,25 @@
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string>org.rcmca.roadwatch</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>rcmcs</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
+	<key>LSApplicationQueriesSchemes</key>
+	<array>
+		<string>mailto</string>
+	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UIApplicationSceneManifest</key>

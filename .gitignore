@@ -22,3 +22,9 @@ build/
 mobile/build/
 
 uploads/
+
+# Android release signing secrets — never commit these.
+mobile/android/key.properties
+**/*.jks
+**/*.keystore
+

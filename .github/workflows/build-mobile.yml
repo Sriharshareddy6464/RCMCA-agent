@@ -1,0 +1,144 @@
+name: Build Mobile
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+      - "mvp-*"
+
+permissions:
+  contents: read
+
+# Repository variable wins; otherwise the secret is used; otherwise the public
+# placeholder so tagged builds never fail on an unset value.
+env:
+  RCMCA_API_BASE_URL: ${{ vars.RCMCA_API_BASE_URL || secrets.RCMCA_API_BASE_URL || 'https://api.example.org' }}
+
+jobs:
+  android-release:
+    name: Android release (APK + AAB)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Decode optional release signing secrets
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_PROPERTIES: ${{ secrets.ANDROID_KEY_PROPERTIES }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANDROID_KEYSTORE_BASE64}" ]; then
+            echo "Decoding release keystore to android/app/upload-keystore.jks"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 --decode > android/app/upload-keystore.jks
+            echo "Make sure storeFile in ANDROID_KEY_PROPERTIES points at upload-keystore.jks (or an absolute path)."
+          else
+            echo "ANDROID_KEYSTORE_BASE64 not set - release build will use debug signing."
+          fi
+          if [ -n "${ANDROID_KEY_PROPERTIES}" ]; then
+            echo "Writing android/key.properties from ANDROID_KEY_PROPERTIES"
+            printf '%s\n' "${ANDROID_KEY_PROPERTIES}" > android/key.properties
+          else
+            echo "ANDROID_KEY_PROPERTIES not set - no release signing config."
+          fi
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Flutter analyze
+        # Errors still fail the build; pre-existing warnings/infos in mobile/lib
+        # are reported but do not block artifact generation.
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+
+      - name: Flutter test
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release --dart-define=RCMCA_API_BASE_URL="${RCMCA_API_BASE_URL}"
+
+      - name: Build release AAB
+        run: flutter build appbundle --release --dart-define=RCMCA_API_BASE_URL="${RCMCA_API_BASE_URL}"
+
+      - name: Upload app-release.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-release-apk
+          path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+
+      - name: Upload app-release.aab
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-release-aab
+          path: mobile/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+
+  ios-package:
+    name: iOS unsigned IPA
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          if [ -d /Applications/Xcode.app ]; then
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          fi
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build iOS (unsigned)
+        run: flutter build ios --release --no-codesign --dart-define=RCMCA_API_BASE_URL="${RCMCA_API_BASE_URL}"
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="build/ios/iphoneos/Runner.app"
+          if [ ! -d "${APP_PATH}" ]; then
+            echo "Expected ${APP_PATH} to exist after flutter build ios" >&2
+            exit 1
+          fi
+          rm -rf build/ios/ipa Payload
+          mkdir -p Payload build/ios/ipa
+          cp -R "${APP_PATH}" Payload/Runner.app
+          # -y keeps symlinks intact inside the .app bundle.
+          zip -r -y -q build/ios/ipa/RCMCA-RoadWatch-ios-unsigned.ipa Payload
+          rm -rf Payload
+          ls -lh build/ios/ipa/RCMCA-RoadWatch-ios-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: RCMCA-RoadWatch-ios-unsigned-ipa
+          path: mobile/build/ios/ipa/RCMCA-RoadWatch-ios-unsigned.ipa
+          if-no-files-found: error
