@@ -42,6 +42,7 @@ Defined in `src/types/rcmca.ts`:
 - Survey: `SurveyAnswer`, `SurveyQuestion`, `SurveySheet`, `VerificationSubmission`, `VerificationResponse`.
 - Report and assessment: `ReportIssuePayload`, `ReportIssueResponse`, `IssueAssessmentRequest`, `IssueAssessmentResponse`.
 - Chat: `ChatRequest`, `ChatResponse`, `ChatAction`, `ChatRouteAction`, `ChatIssue`, `DraftEmail`.
+- Component coordination: `ViewportBounds`, `ViewportChange`, and `RoutePlannerInput` in `src/types/contracts.ts`.
 - Remaining endpoints: `RefreshResponse`, `HealthResponse`, upload/presign types, and vision accepted/status types.
 
 ## API layer
@@ -54,12 +55,15 @@ No POST endpoint was invoked on production. Request and response types were deri
 
 `src/types/contracts.ts` is the shared component boundary:
 
-- `MapCanvasProps` carries issues, selection, filters, route, location, refresh state, and callbacks. Map rendering is presentational; shell owns fetching, filters, selection, active route, and cooldown.
+- `MapCanvasProps` carries issues, selection, filters, route, location, refresh state, viewport callbacks, and optional route-planner input/change/submit callbacks. `ViewportChange.bounds` carries exact south/west/north/east bounds when emitted; map rendering is presentational and the shell owns fetching, filters, selection, active route, and cooldown.
+- `SearchFilterBarProps` has the same optional controlled origin/destination values and route-plan callback so the map planner can remain presentational. The callback submits the backend `RoutePlanRequest` to the shell.
 - `MapCanvasHandle` provides `flyTo(point, zoom?)` and `fitRoute()`.
 - `SurveySheetDrawerProps`, `IssueDetailSheetProps`, `ReportIssueModalProps`, and `LocationPickerProps` are controlled props.
 - `ChatPanelProps` receives current location and exposes route-forward and issue-selection callbacks. Chat does not import map.
-- `ForwardedRoute` aliases Flutter's actual `ChatRoutePlan` payload (`routeId`, label, ETA, GeoJSON, route issues, alternatives). The requested shorthand origin/destination/waypoints/labels is not the object Flutter currently hands off; the chat callback in `main.dart` forwards route metadata and geometry only.
-- The report modal owns its self-contained MapLibre location picker using `src/lib/mapStyle.ts`; Flutter's primary flow auto-locks device GPS, and the pinned-map shortcut receives a point selected from the main map. This web contract keeps the requested contained picker.
+- `ForwardedRoute` aliases Flutter's actual `ChatRoutePlan` payload (`routeId`, label, ETA, GeoJSON, route issues, alternatives). `ChatPanelProps.onForwardRoute` already carries it. The shell converts that payload to active route state from its existing geometry and metadata; this handoff does not call `/routes/plan` again.
+- `ReportIssueModalProps.locationMode` is optional and defaults to `gps`; `map_pin` opens the modal's internal MapLibre `LocationPicker`. The report entry is the shell's Report tab; v1 has no report-from-main-map shortcut.
+- `IssueFilters` is already controlled by props. Flutter's map has an informational status legend but no category/status/severity filter UI; do not present the existing web filter shape as a Flutter behavior.
+- `IssueDetailSheetProps.issue` provides the selected `Issue`; the detail sheet does not fetch `GET /api/v1/issues/{id}`.
 - `ResponsiveSheet` is a bottom sheet below 768 px and right drawer at/above 768 px, with Escape close, body scroll lock, and focus trapping.
 
 Skeleton component exports live at every requested path and render exactly a `data-skeleton` div. No feature UI or mock data is included.
@@ -77,13 +81,23 @@ Skeleton component exports live at every requested path and render exactly a `da
 - Separate issue-detail status pill colors from `issue_detail_sheet.dart` (its palette differs from map marker status colors).
 - Explicit slate and route warning/success colors used in Flutter widgets.
 - Flutter card shadow/elevation approximation, radii (4/9/10/12/14/16/20/24 px), spacing (4/8/12/14/16/18/20/24 px), and visible typography sizes.
-- Roboto, matching Flutter Material's default font family. Flutter does not declare a gradient or a custom dark theme. `data-theme="dark"` uses browser system semantic surface/text roles while retaining explicit Flutter accent colors; exact dark Material roles remain framework-derived, not source literals.
+- Roboto, matching Flutter Material's default font family. Flutter does not declare a gradient or a dark theme; the web is light-only regardless of OS appearance.
 
 Every explicit token comment includes the Flutter source location. Token entries from Flutter's framework-generated Material 3 defaults cite the seed declaration.
 
-## Open questions
+## Decisions
 
-1. Flutter has no explicit `darkTheme`; should the web version use system color scheme roles as the CSS currently does, or should a later theme task introduce a dark Material 3 palette?
-2. Flutter's actual chat-to-map payload omits origin/destination names and waypoints; should a future Flutter change add those fields, or should web continue forwarding the exact route geometry/metadata object?
-3. Flutter offers both GPS auto-lock reporting and a main-map pinned-report shortcut. The report modal contract requires an internal location picker; confirm whether that should be the default report path in the web shell.
-4. The production GET samples include a real demo issue. The production issue detail endpoint returned the sample issue successfully; the vision status endpoint was sampled with an unknown UUID and returned its real 404 shape.
+- **D1 Theme:** light-only. Flutter has no `darkTheme` or `themeMode` and renders light regardless of OS appearance.
+- **D2 Chat → map:** forward the exact Flutter `ChatRoutePlan` object (geometry and metadata). The Flutter app is not modified.
+- **D3 Report:** default to GPS auto-lock as in Flutter. The internal `LocationPicker` is the “pin on map” option. There is no report-from-main-map shortcut in v1.
+- **D4 Production data:** production demo data is read-only until Phase 2.
+
+## Per-step notes
+
+- **(a) Chat route handoff:** forwarded routes already carry geometry. The shell converts `ForwardedRoute` to active `RoutePlan` state without a second API call. `POST /api/v1/routes/plan` is only for the Flutter route-planner input.
+- **(b) Refresh cooldown:** the endpoint returns HTTP 200 with cached counts during its 60-second cooldown. The shell tracks cooldown client-side via `refreshCooldownSeconds`.
+- **(c) Issue detail:** `IssueDetailSheet` uses the `Issue` object passed in; it does not call `GET /api/v1/issues/{id}`.
+- **(d) Report:** call `POST /api/v1/uploads/local` with multipart `files` (max 4 files, 8 MiB each, JPEG/PNG/WebP), then call `POST /api/v1/issues/report` with JSON and expect HTTP 201. Production writes remain prohibited until Phase 2.
+- **(e) Viewport:** fetch with `GET /api/v1/issues?south=...&west=...&north=...&east=...&limit=...`.
+
+The production issue detail sample returned HTTP 200. The vision status sample used an unknown UUID and returned its real 404 shape.

@@ -4,6 +4,7 @@
 
 /* Flutter explicit color literals: mobile/lib/main.dart:86-88, 1647-1680, 1785-1808;
    mobile/lib/widgets/issue_detail_sheet.dart:657-665. */
+/* Always light: Flutter main.dart:86-89 declares theme only, with no darkTheme/themeMode. */
 :root {
   color-scheme: light;
   --color-primary: #00838f; /* mobile/lib/main.dart:86-87 */
@@ -37,40 +38,6 @@
   --radius-sheet: 16px; /* mobile/lib/widgets/issue_detail_sheet.dart:553 */
   --radius-pill: 20px; /* mobile/lib/widgets/issue_detail_sheet.dart:620 */
   --shadow-card: 0 2px 4px rgba(0, 0, 0, 0.26); /* mobile/lib/main.dart:2088 */
-}
-
-/* The Flutter app declares ThemeData(colorSchemeSeed: #00838F) but no darkTheme
-   (mobile/lib/main.dart:86-89). Semantic roles remain browser/framework-derived. */
-[data-theme='dark'] {
-  color-scheme: dark;
-  --color-primary: #00838f; /* mobile/lib/main.dart:86-87 */
-  --color-primary-dark: #004d40; /* mobile/lib/main.dart:2085 */
-  --color-route: #00bcd4; /* mobile/lib/main.dart:1023-1026 */
-  --color-route-alternative: #94a3b8; /* mobile/lib/main.dart:1005-1013 */
-  --color-green: #22c55e; /* mobile/lib/main.dart:206-210 */
-  --color-blue: #3b82f6; /* mobile/lib/main.dart:214-218 */
-  --color-yellow: #eab308; /* mobile/lib/main.dart:222-226 */
-  --color-orange: #f97316; /* mobile/lib/main.dart:230-234 */
-  --color-red: #ef4444; /* mobile/lib/main.dart:238-242 */
-  --color-issue-green: #1b8a5a; /* mobile/lib/widgets/issue_detail_sheet.dart:657-658 */
-  --color-issue-blue: #1f6feb; /* mobile/lib/widgets/issue_detail_sheet.dart:659-660 */
-  --color-issue-yellow: #b58105; /* mobile/lib/widgets/issue_detail_sheet.dart:661-662 */
-  --color-issue-orange: #d97706; /* mobile/lib/widgets/issue_detail_sheet.dart:663-664 */
-  --color-issue-red: #d9342b; /* mobile/lib/widgets/issue_detail_sheet.dart:665-666 */
-  --color-condition-clean: #1b8a5a; /* mobile/lib/widgets/survey_sheets.dart:36 */
-  --color-condition-good: #4d9a4d; /* mobile/lib/widgets/survey_sheets.dart:37 */
-  --color-condition-normal: #b58105; /* mobile/lib/widgets/survey_sheets.dart:38 */
-  --color-condition-bad: #d97706; /* mobile/lib/widgets/survey_sheets.dart:39 */
-  --color-condition-worst: #d9342b; /* mobile/lib/widgets/survey_sheets.dart:40 */
-  --color-surface: Canvas; /* no Flutter dark surface literal; mobile/lib/main.dart:86-89 */
-  --color-outline: GrayText; /* no Flutter dark outline literal; mobile/lib/main.dart:86-89 */
-  --color-text: CanvasText; /* no Flutter dark text literal; mobile/lib/main.dart:86-89 */
-  --color-muted: GrayText; /* no Flutter dark muted literal; mobile/lib/main.dart:86-89 */
-  --color-route-warning-bg: Canvas; /* no Flutter dark warning surface; mobile/lib/main.dart:86-89 */
-  --color-route-warning-text: CanvasText; /* no Flutter dark warning text; mobile/lib/main.dart:86-89 */
-  --color-route-success-bg: Canvas; /* no Flutter dark success surface; mobile/lib/main.dart:86-89 */
-  --color-route-success-text: CanvasText; /* no Flutter dark success text; mobile/lib/main.dart:86-89 */
-  --shadow-card: 0 2px 4px rgba(0, 0, 0, 0.26);
 }
 
 * { box-sizing: border-box; }
