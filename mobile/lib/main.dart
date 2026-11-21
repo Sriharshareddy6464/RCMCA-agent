@@ -4,6 +4,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:maplibre_gl/maplibre_gl.dart';
@@ -13,7 +14,8 @@ import 'package:uuid/uuid.dart';
 import 'navigation_controller.dart';
 import 'screens/chat_screen.dart';
 import 'widgets/issue_detail_sheet.dart';
-import 'widgets/survey_sheets.dart';
+import 'widgets/survey_sheets.dart' hide showNewIssueReportSheet;
+import 'widgets/survey_sheets.dart' as survey show showNewIssueReportSheet;
 
 export 'navigation_controller.dart';
 
@@ -66,6 +68,16 @@ class _RcmcaAppState extends State<RcmcaApp> {
         setState(() => _currentTab = index);
       }
     };
+
+    // Lightweight MethodChannel handler for deep links (e.g. rcmcs://navigate?route_id=...)
+    const MethodChannel('rcmca/deeplink').setMethodCallHandler((call) async {
+      if (call.method == 'onDeepLink' && call.arguments is String) {
+        final uri = Uri.tryParse(call.arguments as String);
+        if (uri != null) {
+          await NavigationController.instance.handleDeepLinkUri(uri);
+        }
+      }
+    });
   }
 
   @override
@@ -85,11 +97,13 @@ class _RcmcaAppState extends State<RcmcaApp> {
                 onStartDriveway: (ChatRoutePlan plan) async {
                   await activateRecommendedRoute({
                     'route_id': plan.routeId,
+                    'recommended_route_id': plan.routeId,
                     'label': plan.label,
                     'distance_m': plan.distanceKm * 1000.0,
                     'duration_s': plan.durationMin * 60.0,
                     'geometry': plan.geometry,
                     'hazards': plan.issuesOnRoute,
+                    'routes': plan.routes,
                   });
                 },
               ),
@@ -399,6 +413,19 @@ class RoadMapScreenState extends State<RoadMapScreen> {
       await activateRecommendedRoute(payload, startDriveway: startDriveway);
     };
 
+    // Register callback for deep link navigation (rcmcs://navigate?route_id=...)
+    NavigationController.instance.onDeepLinkRoute = ({
+      String? routeId,
+      String? origin,
+      String? destination,
+    }) async {
+      await _handleDeepLinkRoute(
+        routeId: routeId,
+        origin: origin,
+        destination: destination,
+      );
+    };
+
     // If a payload was queued before mounting, stage it
     if (NavigationController.instance.lastRoutePayload != null) {
       _pendingRoutePayload = NavigationController.instance.lastRoutePayload;
@@ -421,7 +448,38 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     if (NavigationController.instance.onActivateRecommendedRoute != null) {
       NavigationController.instance.onActivateRecommendedRoute = null;
     }
+    if (NavigationController.instance.onDeepLinkRoute != null) {
+      NavigationController.instance.onDeepLinkRoute = null;
+    }
     super.dispose();
+  }
+
+  /// Handles deep links like `rcmcs://navigate?route_id=...`
+  Future<void> _handleDeepLinkRoute({
+    String? routeId,
+    String? origin,
+    String? destination,
+  }) async {
+    if (origin != null && origin.isNotEmpty) {
+      _originController.text = origin;
+    }
+    if (destination != null && destination.isNotEmpty) {
+      _destinationController.text = destination;
+    }
+
+    final last = NavigationController.instance.lastRoutePayload;
+    if (last != null &&
+        routeId != null &&
+        (last['recommended_route_id'] == routeId ||
+         last['route_id'] == routeId)) {
+      await activateRecommendedRoute(last, startDriveway: true);
+      return;
+    }
+
+    await _planRoute();
+    if (_recommendedCoordinates.isNotEmpty) {
+      await _startInAppDriveway();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -809,23 +867,6 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     return dashes;
   }
 
-  /// Generates plausible alternative/rejected detour routes if backend did not include candidates.
-  List<List<LatLng>> _generateAlternativeDetours(List<LatLng> recommended) {
-    if (recommended.length < 3) return [];
-    final List<LatLng> alt1 = [];
-    final List<LatLng> alt2 = [];
-    final n = recommended.length;
-
-    for (int i = 0; i < n; i++) {
-      final pt = recommended[i];
-      final frac = i / (n - 1);
-      final curve = sin(frac * pi); // Arc offset peaking at mid-route
-      alt1.add(LatLng(pt.latitude + 0.009 * curve, pt.longitude - 0.007 * curve));
-      alt2.add(LatLng(pt.latitude - 0.008 * curve, pt.longitude + 0.009 * curve));
-    }
-    return [alt1, alt2];
-  }
-
   LatLngBounds _calculateBounds(List<LatLng> points) {
     double minLat = points.first.latitude;
     double maxLat = points.first.latitude;
@@ -874,7 +915,9 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         if (r is Map) {
           final isRec = r['is_recommended'] == true ||
               (routePayload['recommended_route_id'] != null &&
-                  r['route_id'] == routePayload['recommended_route_id']);
+                  r['route_id'] == routePayload['recommended_route_id']) ||
+              (routePayload['route_id'] != null &&
+                  r['route_id'] == routePayload['route_id']);
           final geom = r['geometry'];
           if (geom is Map && geom['coordinates'] != null) {
             final coords = _parseCoordinatesList(geom['coordinates']);
@@ -924,10 +967,6 @@ class RoadMapScreenState extends State<RoadMapScreen> {
           }
         }
       }
-    }
-
-    if (rejectedGeometries.isEmpty) {
-      rejectedGeometries = _generateAlternativeDetours(recommended);
     }
 
     // 4. Update Text Inputs if names were provided
@@ -999,7 +1038,9 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         if (r is Map &&
             (r['is_recommended'] == true ||
                 (routePayload['recommended_route_id'] != null &&
-                    r['route_id'] == routePayload['recommended_route_id']))) {
+                    r['route_id'] == routePayload['recommended_route_id']) ||
+                (routePayload['route_id'] != null &&
+                    r['route_id'] == routePayload['route_id']))) {
           recommendedRoute = Map<String, dynamic>.from(r);
           break;
         }
@@ -1036,10 +1077,7 @@ class RoadMapScreenState extends State<RoadMapScreen> {
         }
       }
     }
-    int totalAvoided = avoidedIds.length;
-    if (totalAvoided == 0 && routePayload['avoided_severe_hazards'] == true) {
-      totalAvoided = 2; // Severe hazards successfully bypassed
-    }
+    final int totalAvoided = avoidedIds.length;
 
     final count = routeHazards.length;
     final bannerText =
@@ -1091,6 +1129,10 @@ class RoadMapScreenState extends State<RoadMapScreen> {
       });
     }
 
+    // Automatically start continuous location proximity stream whenever a route is activated
+    _navigationActive = true;
+    unawaited(_startLocation());
+
     // 8. Start in-app driveway mode or fit overview bounds
     if (startDriveway) {
       await _startInAppDriveway();
@@ -1129,6 +1171,10 @@ class RoadMapScreenState extends State<RoadMapScreen> {
     // 2. Render route lines (dashed gray rejected + bold cyan/teal recommended)
     // and launch in-app driveway mode (45° camera pitch, continuous progress simulation).
     await _applyRoutePayload(routePayload, startDriveway: startDriveway);
+
+    // 3. Automatically ensure continuous location proximity check is running
+    _navigationActive = true;
+    unawaited(_startLocation());
   }
 
   // ---------------------------------------------------------------------------
@@ -1213,10 +1259,21 @@ class RoadMapScreenState extends State<RoadMapScreen> {
                 : _recommendedCoordinates.first,
           );
 
+    final initialDest = _recommendedCoordinates.last;
+    final initialRemainingM = Geolocator.distanceBetween(
+      initialTarget.latitude,
+      initialTarget.longitude,
+      initialDest.latitude,
+      initialDest.longitude,
+    );
+    final initialEtaMin = ((initialRemainingM / 12.0) / 60.0).ceil();
+
     setState(() {
       _drivewayActive = true;
       _drivewayBearing = initialBearing;
       _lastDrivewayPosition = initialPos;
+      _drivewayRemainingMeters = initialRemainingM;
+      _drivewayEtaMinutes = initialEtaMin > 0 ? initialEtaMin : 1;
       _routePlannerExpanded = false;
     });
 
@@ -1312,6 +1369,10 @@ class RoadMapScreenState extends State<RoadMapScreen> {
           nearby = hazard;
           break;
         }
+      }
+
+      if (_navigationActive || _drivewayActive) {
+        _checkNearbyHazards(pos);
       }
 
       // Remaining distance along recommended coordinates to destination
@@ -2010,24 +2071,55 @@ class RoadMapScreenState extends State<RoadMapScreen> {
                 _handleMapLongClick(coordinates);
               },
             ),
-            // Minimal compact "Exit" chip in the top corner during Driveway Mode
+            // Compact top Driveway status chip with live distance, ETA, and Exit button
             if (_drivewayActive)
               Positioned(
                 top: 14,
+                left: 14,
                 right: 14,
-                child: ActionChip(
-                  avatar: const Icon(Icons.close, size: 16, color: Color(0xFFB91C1C)),
-                  label: const Text(
-                    'Exit Driveway',
-                    style: TextStyle(
-                      color: Color(0xFFB91C1C),
-                      fontWeight: FontWeight.bold,
-                      fontSize: 12,
+                child: Row(
+                  children: [
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF004D40).withOpacity(0.95),
+                        borderRadius: BorderRadius.circular(20),
+                        boxShadow: const [
+                          BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2)),
+                        ],
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Icon(Icons.navigation, size: 15, color: Color(0xFF80DEEA)),
+                          const SizedBox(width: 6),
+                          Text(
+                            '${(_drivewayRemainingMeters / 1000.0).toStringAsFixed(1)} km · $_drivewayEtaMinutes min',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12.5,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
-                  ),
-                  backgroundColor: const Color(0xFFFEE2E2),
-                  side: const BorderSide(color: Color(0xFFFCA5A5)),
-                  onPressed: () => _stopInAppDriveway(resetCamera: true),
+                    const Spacer(),
+                    ActionChip(
+                      avatar: const Icon(Icons.close, size: 15, color: Color(0xFFB91C1C)),
+                      label: const Text(
+                        'Exit Driveway',
+                        style: TextStyle(
+                          color: Color(0xFFB91C1C),
+                          fontWeight: FontWeight.bold,
+                          fontSize: 12,
+                        ),
+                      ),
+                      backgroundColor: const Color(0xFFFEE2E2),
+                      side: const BorderSide(color: Color(0xFFFCA5A5)),
+                      onPressed: () => _stopInAppDriveway(resetCamera: true),
+                    ),
+                  ],
                 ),
               ),
             // Floating "Unpin" action button/chip for accidental long-press pins
@@ -2112,7 +2204,7 @@ Future<ReportedIssueResult?> showNewIssueReportSheet(
       ),
     );
   }
-  return showNewIssueReportSheet(context, onSubmitted: onSubmitted);
+  return survey.showNewIssueReportSheet(context, onSubmitted: onSubmitted);
 }
 
 /// Modal sheet for pre-populated road pin reports

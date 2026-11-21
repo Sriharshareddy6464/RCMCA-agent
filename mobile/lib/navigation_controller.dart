@@ -22,6 +22,41 @@ class NavigationController {
   /// Last activated route payload (preserved across tab switches or pending initialization).
   Map<String, dynamic>? lastRoutePayload;
 
+  /// Callback registered by RoadMapScreen to activate a route from a deep link.
+  Future<void> Function({String? routeId, String? origin, String? destination})?
+      onDeepLinkRoute;
+
+  /// Routes `rcmcs://navigate?route_id=...` deep links to activate that route on the Map tab.
+  Future<void> handleDeepLinkUri(Uri uri) async {
+    if (uri.scheme == 'rcmcs' || uri.scheme == 'rcmc') {
+      if (uri.host == 'navigate' || uri.path.contains('navigate')) {
+        final routeId = uri.queryParameters['route_id'];
+        final origin = uri.queryParameters['origin'];
+        final destination = uri.queryParameters['destination'];
+
+        // 1. Switch directly to Map tab (tab index 0)
+        switchTab?.call(0);
+
+        // 2. Activate route through registered handler
+        if (onDeepLinkRoute != null) {
+          await onDeepLinkRoute!(
+            routeId: routeId,
+            origin: origin,
+            destination: destination,
+          );
+        }
+      }
+    }
+  }
+
+  /// Parses a deep link string and routes it.
+  Future<void> handleDeepLink(String link) async {
+    final uri = Uri.tryParse(link);
+    if (uri != null) {
+      await handleDeepLinkUri(uri);
+    }
+  }
+
   /// Clean callback/controller method exposed for the Chatbot tab and external callers.
   ///
   /// Switches directly to the Map tab (tab index 0) and activates the recommended
@@ -55,3 +90,11 @@ Future<void> activateRecommendedRoute(
       routePayload,
       startDriveway: startDriveway,
     );
+
+/// Global convenience function to handle deep links.
+Future<void> handleDeepLink(String link) =>
+    NavigationController.instance.handleDeepLink(link);
+
+/// Global convenience function to handle deep link URIs.
+Future<void> handleDeepLinkUri(Uri uri) =>
+    NavigationController.instance.handleDeepLinkUri(uri);

@@ -20,6 +20,7 @@ class ChatRoutePlan {
     required this.durationMin,
     required this.geometry,
     this.issuesOnRoute = const [],
+    this.routes = const [],
   });
 
   final String routeId;
@@ -28,6 +29,7 @@ class ChatRoutePlan {
   final double durationMin;
   final Map<String, dynamic> geometry;
   final List<Map<String, dynamic>> issuesOnRoute;
+  final List<Map<String, dynamic>> routes;
 
   int get criticalIssueCount => issuesOnRoute.where((issue) {
         final color = issue['status_color'];
@@ -100,8 +102,9 @@ class ChatReply {
         label: _asString(selected?['label']) ?? 'Safest available route',
         distanceKm: _asDouble(selected?['distance_km']) ?? 0,
         durationMin: _asDouble(selected?['duration_min']) ?? 0,
-        geometry: geometry ?? const <String, dynamic>{},
+        geometry: geometry ?? _asMap(selected?['geometry']) ?? const <String, dynamic>{},
         issuesOnRoute: _asMaps(selected?['issues_on_route']),
+        routes: routes,
       );
     }
     return ChatReply(
