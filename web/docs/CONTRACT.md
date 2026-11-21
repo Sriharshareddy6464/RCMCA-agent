@@ -42,7 +42,7 @@ Defined in `src/types/rcmca.ts`:
 - Survey: `SurveyAnswer`, `SurveyQuestion`, `SurveySheet`, `VerificationSubmission`, `VerificationResponse`.
 - Report and assessment: `ReportIssuePayload`, `ReportIssueResponse`, `IssueAssessmentRequest`, `IssueAssessmentResponse`.
 - Chat: `ChatRequest`, `ChatResponse`, `ChatAction`, `ChatRouteAction`, `ChatIssue`, `DraftEmail`.
-- Component coordination: `ViewportBounds`, `ViewportChange`, and `RoutePlannerInput` in `src/types/contracts.ts`.
+- Component coordination: `ViewportBounds`, `ViewportChange`, `RoutePlannerInput`, and `DrivewayState` in `src/types/contracts.ts`.
 - Remaining endpoints: `RefreshResponse`, `HealthResponse`, upload/presign types, and vision accepted/status types.
 
 ## API layer
@@ -55,10 +55,11 @@ No POST endpoint was invoked on production. Request and response types were deri
 
 `src/types/contracts.ts` is the shared component boundary:
 
-- `MapCanvasProps` carries issues, selection, filters, route, location, refresh state, viewport callbacks, and optional route-planner input/change/submit callbacks. `ViewportChange.bounds` carries exact south/west/north/east bounds when emitted; map rendering is presentational and the shell owns fetching, filters, selection, active route, and cooldown.
+- `MapCanvasProps` carries issues, selection, filters, route, location, refresh state, viewport callbacks, optional route-planner input/change/submit callbacks, and optional `DrivewayState`. `ViewportChange.bounds` carries exact south/west/north/east bounds when emitted; map rendering is presentational and the shell owns fetching, filters, selection, active route, and cooldown.
 - `SearchFilterBarProps` has the same optional controlled origin/destination values and route-plan callback so the map planner can remain presentational. The callback submits the backend `RoutePlanRequest` to the shell.
+- `RouteEtaCardProps` receives optional `DrivewayState` and optional start/exit callbacks; `MapControlsProps` can expose an exit callback while driveway mode is active. Navigation remains shell-owned.
 - `MapCanvasHandle` provides `flyTo(point, zoom?)` and `fitRoute()`.
-- `SurveySheetDrawerProps`, `IssueDetailSheetProps`, `ReportIssueModalProps`, and `LocationPickerProps` are controlled props.
+- `SurveySheetDrawerProps` optionally receives `userLocation` so the shell can provide Flutter's verification-distance context. `IssueDetailSheetProps`, `ReportIssueModalProps`, and `LocationPickerProps` are controlled props.
 - `ChatPanelProps` receives current location and exposes route-forward and issue-selection callbacks. Chat does not import map.
 - `ForwardedRoute` aliases Flutter's actual `ChatRoutePlan` payload (`routeId`, label, ETA, GeoJSON, route issues, alternatives). `ChatPanelProps.onForwardRoute` already carries it. The shell converts that payload to active route state from its existing geometry and metadata; this handoff does not call `/routes/plan` again.
 - `ReportIssueModalProps.locationMode` is optional and defaults to `gps`; `map_pin` opens the modal's internal MapLibre `LocationPicker`. The report entry is the shell's Report tab; v1 has no report-from-main-map shortcut.

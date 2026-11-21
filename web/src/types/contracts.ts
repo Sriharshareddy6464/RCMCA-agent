@@ -31,6 +31,14 @@ export interface RoutePlannerInput {
   planning?: boolean
 }
 
+export interface DrivewayState {
+  active: boolean
+  remainingMeters: number
+  etaMinutes: number
+  bearingDegrees?: number
+  nearbyHazard?: Issue | null
+}
+
 export interface IssueFilters {
   categories: Category[]
   statusColors: StatusColor[]
@@ -46,6 +54,8 @@ export interface MapCanvasProps {
   filters: IssueFilters
   route: RoutePlan | null
   userLocation: LatLng | null
+  /** Optional live-drive presentation state; navigation effects remain shell-owned. */
+  driveway?: DrivewayState
   refresh: RefreshState
   onSelectIssue(id: string | null): void
   onViewportChange(viewport: ViewportChange): void
@@ -81,11 +91,16 @@ export interface MapControlsProps {
   onLocate(): void
   onClearRoute(): void
   hasRoute: boolean
+  drivewayActive?: boolean
+  onExitDriveway?(): void
 }
 
 export interface RouteEtaCardProps {
   route: RoutePlan | null
   onClearRoute(): void
+  driveway?: DrivewayState
+  onStartDriveway?(): void
+  onExitDriveway?(): void
 }
 
 export interface SurveySheetDrawerProps {
@@ -93,6 +108,7 @@ export interface SurveySheetDrawerProps {
   open: boolean
   onClose(): void
   onIssueChanged(issue: Issue): void
+  userLocation?: LatLng | null
 }
 
 export interface IssueDetailSheetProps {
