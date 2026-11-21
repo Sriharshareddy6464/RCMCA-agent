@@ -82,7 +82,7 @@ export const tokens = {
     body: '13px', // mobile/lib/widgets/survey_sheets.dart:1280
     bodyLarge: '14px', // mobile/lib/main.dart:1989
     compactBody: '12.5px', // mobile/lib/widgets/survey_sheets.dart:1240
-    title: '20px', // Material titleLarge use in mobile/lib/widgets/survey_sheets.dart:876 (font size comes from M3)
+    title: '22px', // Material 3 titleLarge use in mobile/lib/widgets/survey_sheets.dart:883 (font size comes from M3)
     family: 'Roboto, Arial, sans-serif', // Flutter Material default: mobile/lib/main.dart:86
   },
 } as const

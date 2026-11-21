@@ -68,7 +68,7 @@ async function parseResponse<T>(response: Response): Promise<T> {
     try { payload = JSON.parse(raw) as unknown } catch { payload = raw }
   }
   if (!response.ok) {
-    if (response.status === 429) {
+    if (response.status === 429 && response.url.includes('/api/v1/issues/refresh')) {
       const header = response.headers.get('Retry-After')
       const retryAfterSeconds = header && Number.isFinite(Number(header)) ? Number(header) : 60
       throw new RefreshCooldownError(retryAfterSeconds, payload)

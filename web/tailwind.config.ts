@@ -83,6 +83,7 @@ export default {
         'flutter-body': '13px', // mobile/lib/widgets/survey_sheets.dart:1280
         'flutter-body-lg': '14px', // mobile/lib/main.dart:1989
         'flutter-compact': '12.5px', // mobile/lib/widgets/survey_sheets.dart:1240
+        'flutter-title': '22px', // Material 3 titleLarge use: mobile/lib/widgets/survey_sheets.dart:883
       },
       boxShadow: {
         'flutter-card': '0 2px 4px rgba(0, 0, 0, 0.26)', // mobile/lib/main.dart:2088
