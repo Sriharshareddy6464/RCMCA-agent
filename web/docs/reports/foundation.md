@@ -3,7 +3,7 @@
 ## Created
 
 - Vite + React 18 + TypeScript + Tailwind scaffold, exact dependency pins, and npm lockfile.
-- Flutter-referenced light/dark CSS variables, Tailwind theme entries, token export, and the Material Roboto font.
+- Flutter-referenced light-only CSS variables, Tailwind theme entries, token export, and the Material Roboto font.
 - Typed RCMCA endpoint models, API wrappers, map-style defaults, responsive UI primitives, component contracts, and all requested skeleton components.
 - Endpoint inventory, API mismatch notes, live GET response samples, exact agent rules, and foundation contract.
 
@@ -16,12 +16,29 @@
 - Contracts and props are in `src/types/contracts.ts`; model/request/response interfaces are in `src/types/rcmca.ts`.
 - Skeletons export default components at all requested component paths; `MapCanvas` uses `forwardRef` with `MapCanvasHandle`.
 
-## Flutter differences and open questions
+## Step 0b additive signature changes
 
-- Flutter has no explicit dark theme or gradient literals. CSS keeps explicit accent colors and uses browser semantic roles for dark surfaces.
-- Flutter's chat route handoff forwards route ID, label, ETA, GeoJSON, issues, and candidate routes; it does not forward origin/destination/waypoints/labels as a separate object.
-- The web report contract keeps an internal location picker as requested, while Flutter uses auto-locked GPS for the full report and a pin chosen from the main map for its shortcut.
-- The actual nearby endpoint is `GET /api/v1/issues`, not `/api/v1/issues/nearby`; see `docs/CONTRACT.md`.
+Each change is additive; existing props, names, and exports remain intact. Skeleton component bodies still render only their `data-skeleton` div.
+
+| File | Old signature | New signature | Flutter reason |
+|---|---|---|---|
+| `src/types/contracts.ts` — `ViewportChange` | `{ center: LatLng; zoom: number; radiusM: number }` | Same fields plus `bounds?: ViewportBounds` (`south`, `west`, `north`, `east`) | `mobile/lib/main.dart` reads the visible map region and requests `/api/v1/issues` with those four bounds. |
+| `src/types/contracts.ts` — `MapCanvasProps` | Existing issue/selection/filter/route/location/refresh props and map callbacks | Same props plus optional `routePlanner`, `onRoutePlannerChange`, `onPlanRoute`, and `onSwapRouteEndpoints` | Flutter's map includes controlled A→B inputs, swap, planning state, and submits `/api/v1/routes/plan`; fetching remains shell-owned. |
+| `src/types/contracts.ts` — `SearchFilterBarProps` | `{ filters; onFiltersChange; onRefresh; refresh }` | Same fields plus optional `routePlanner`, `onRoutePlannerChange`, `onPlanRoute`, and `onSwapRouteEndpoints` | Provides the map's A→B route planner inputs and callbacks without putting API calls in the component. |
+| `src/types/contracts.ts` — `ReportIssueModalProps` | `{ open; initialLocation; onClose; onSubmitted }` | Same fields plus optional `locationMode?: 'gps' | 'map_pin'` (default `gps`) | Flutter auto-locks GPS for a report; this makes its internal map picker an explicit alternate mode. |
+
+No direct skeleton component signature or body edits were needed: the skeletons consume the updated shared prop interfaces. `ChatPanelProps.onForwardRoute` already passes Flutter's exact `ChatRoutePlan` data. `RefreshState` already exposes loading/cooldown and `onRefresh`; shell uses `refreshCooldownSeconds`. `IssueDetailSheetProps.issue` already carries the selected issue.
+
+Flutter's map shows a status legend but no filters. The existing `IssueFilters` contract is preserved without claiming that category/status/severity filtering exists in Flutter. The Report tab is the report entry point; no report-from-main-map callback is added under the v1 decision. App shell owns that tab state internally.
+
+Flutter has no `darkTheme` or `themeMode`, and no gradient literals. Web CSS is now light-only. Flutter's chat route handoff forwards route ID, label, ETA, GeoJSON, issues, and candidate routes; it does not send separate origin/destination/waypoint labels. The actual nearby endpoint is `GET /api/v1/issues`, not `/api/v1/issues/nearby`; see `docs/CONTRACT.md`.
+
+## Decisions
+
+- D1: light-only, regardless of OS appearance.
+- D2: forward exact ChatRoutePlan geometry and metadata; Flutter remains unchanged.
+- D3: GPS auto-lock by default; the internal LocationPicker is the pin-on-map option; no map-origin report shortcut in v1.
+- D4: production demo data stays read-only until Phase 2.
 
 ## Requests
 
@@ -31,6 +48,8 @@ None.
 
 - `npm ci && npm run build`: passed; Vite 8.3.8 emitted a production bundle.
 - `npx tsc --noEmit`: passed with no diagnostics.
+- `npm run dev -- --host 0.0.0.0`: Vite 8.3.8 ready in 1238 ms at `http://localhost:5173/`.
+- Not visually verified at 1440x900 or 390x844: Chrome could not connect to `localhost:5173` (`ERR_CONNECTION_TIMED_OUT`) although Vite reported ready.
 - All 12 requested skeleton paths exist.
 - Production GET `/health`: HTTP 200, `{"status":"ok"}`. GET issue list and detail: HTTP 200. Vision status sample: HTTP 404 for the unknown test UUID. Brief-only `/api/v1/issues/nearby`: HTTP 422.
 - No production POST requests were sent.
