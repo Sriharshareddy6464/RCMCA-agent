@@ -92,6 +92,11 @@ Every explicit token comment includes the Flutter source location. Token entries
 - **D2 Chat → map:** forward the exact Flutter `ChatRoutePlan` object (geometry and metadata). The Flutter app is not modified.
 - **D3 Report:** default to GPS auto-lock as in Flutter. The internal `LocationPicker` is the “pin on map” option. There is no report-from-main-map shortcut in v1.
 - **D4 Production data:** production demo data is read-only until Phase 2.
+- **D5 Chat route action:** plot + fit overview + ETA card with explicit Start Driveway; no auto-start (Flutter auto-starts; deliberate desktop deviation, one boolean to flip).
+- **D6 Verification geofence:** pin-tap = no distance, no geofence. Driveway proximity prompt fires once per hazard within 50 m and passes `distanceMeters`. Verify mode blocks submit beyond 50 m; report mode ignores it.
+- **D7 Report:** Flutter's survey flow (photo capture + survey layers presence/quality/impact/evidence + GPS lock/pin), not category/severity chips + description unless Flutter's flow has them. Verify and report share one flow engine.
+- **D8 Refresh:** GET reload (`onReloadHazards`) vs POST refresh (`onRefresh`). Client cooldown is a mission addition (Flutter has none). Per a Flutter comment, POST refresh scrapes news and seeds ~100 issues: production POST only in Phase 2 with human approval.
+- **D9 Tabs:** Map, Chatbot and Report tabs stay mounted at all times (Flutter `IndexedStack`).
 
 ## Per-step notes
 
@@ -100,5 +105,6 @@ Every explicit token comment includes the Flutter source location. Token entries
 - **(c) Issue detail:** `IssueDetailSheet` uses the `Issue` object passed in; it does not call `GET /api/v1/issues/{id}`.
 - **(d) Report:** call `POST /api/v1/uploads/local` with multipart `files` (max 4 files, 8 MiB each, JPEG/PNG/WebP), then call `POST /api/v1/issues/report` with JSON and expect HTTP 201. Production writes remain prohibited until Phase 2.
 - **(e) Viewport:** fetch with `GET /api/v1/issues?south=...&west=...&north=...&east=...&limit=...`.
+- **(f) Hazard reload actions:** `onReloadHazards` performs GET `/api/v1/issues`; `onRefresh` performs POST `/api/v1/issues/refresh` and then reloads issues.
 
 The production issue detail sample returned HTTP 200. The vision status sample used an unknown UUID and returned its real 404 shape.

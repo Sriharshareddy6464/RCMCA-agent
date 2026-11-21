@@ -81,16 +81,27 @@ async function parseResponse<T>(response: Response): Promise<T> {
   return payload as T
 }
 
+async function request<T>(url: string, init: RequestInit, timeoutMs: number): Promise<T> {
+  const signal = AbortSignal.timeout(timeoutMs)
+  try {
+    return await parseResponse<T>(await fetch(url, { ...init, signal }))
+  } catch (error) {
+    if (signal.aborted) throw new ApiError('Request timed out', 408, null)
+    throw error
+  }
+}
+
 async function get<T>(path: string): Promise<T> {
-  return parseResponse<T>(await fetch(`${API_BASE_URL}${path}`, { headers: { Accept: 'application/json' } }))
+  const timeoutMs = path.startsWith('/api/v1/issues?') ? 12_000 : 30_000
+  return request(`${API_BASE_URL}${path}`, { headers: { Accept: 'application/json' } }, timeoutMs)
 }
 
 async function json<T>(path: string, method: 'POST', body: unknown): Promise<T> {
-  return parseResponse<T>(await fetch(`${API_BASE_URL}${path}`, {
+  return request(`${API_BASE_URL}${path}`, {
     method,
     headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  }))
+  }, 30_000)
 }
 
 export const getHealth = (): Promise<HealthResponse> => get('/health')
@@ -111,10 +122,10 @@ export const reportIssue = (payload: ReportIssuePayload): Promise<ReportIssueRes
   json('/api/v1/issues/report', 'POST', payload)
 
 export async function refreshIssues(): Promise<RefreshResponse> {
-  return parseResponse<RefreshResponse>(await fetch(`${API_BASE_URL}/api/v1/issues/refresh`, {
+  return request(`${API_BASE_URL}/api/v1/issues/refresh`, {
     method: 'POST',
     headers: { Accept: 'application/json' },
-  }))
+  }, 15_000)
 }
 
 export const planRoute = (payload: RoutePlanRequest): Promise<RoutePlan> =>
@@ -135,11 +146,11 @@ export const assessIssue = (payload: IssueAssessmentRequest): Promise<IssueAsses
 export async function uploadLocal(files: File[]): Promise<UploadLocalResponse> {
   const form = new FormData()
   for (const file of files) form.append('files', file, file.name)
-  return parseResponse<UploadLocalResponse>(await fetch(`${API_BASE_URL}/api/v1/uploads/local`, {
+  return request(`${API_BASE_URL}/api/v1/uploads/local`, {
     method: 'POST',
     headers: { Accept: 'application/json' },
     body: form,
-  }))
+  }, 30_000)
 }
 
 export const presignUpload = (payload: PresignRequest): Promise<PresignResponse> =>
@@ -148,10 +159,11 @@ export const presignUpload = (payload: PresignRequest): Promise<PresignResponse>
 export async function uploadVisionImage(issueId: string, image: File): Promise<VisionAssessmentAccepted> {
   const form = new FormData()
   form.append('image', image, image.name)
-  return parseResponse<VisionAssessmentAccepted>(await fetch(
+  return request<VisionAssessmentAccepted>(
     `${API_BASE_URL}/api/v1/issues/${encodeURIComponent(issueId)}/vision`,
     { method: 'POST', headers: { Accept: 'application/json' }, body: form },
-  ))
+    30_000,
+  )
 }
 
 export const getVisionAssessment = (issueId: string, assessmentId: string): Promise<VisionAssessmentStatus> =>

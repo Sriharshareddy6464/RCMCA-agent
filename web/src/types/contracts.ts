@@ -60,6 +60,8 @@ export interface MapCanvasProps {
   onSelectIssue(id: string | null): void
   onViewportChange(viewport: ViewportChange): void
   onFiltersChange(filters: IssueFilters): void
+  /** GET /issues reload; distinct from onRefresh, which POSTs refresh then reloads. */
+  onReloadHazards?(): void
   onRefresh(): void
   onLocate(): void
   onClearRoute(): void
@@ -78,6 +80,8 @@ export interface MapCanvasHandle {
 export interface SearchFilterBarProps {
   filters: IssueFilters
   onFiltersChange(filters: IssueFilters): void
+  /** GET /issues reload; distinct from onRefresh, which POSTs refresh then reloads. */
+  onReloadHazards?(): void
   onRefresh(): void
   refresh: RefreshState
   /** Optional to preserve existing consumers; the shell owns the input state. */
@@ -108,7 +112,10 @@ export interface SurveySheetDrawerProps {
   open: boolean
   onClose(): void
   onIssueChanged(issue: Issue): void
+  /** Do not use for geofence; use distanceMeters. */
   userLocation?: LatLng | null
+  /** Null/undefined for pin-tap verification; measured distance for a proximity prompt. */
+  distanceMeters?: number | null
 }
 
 export interface IssueDetailSheetProps {
@@ -137,6 +144,7 @@ export type ForwardedRoute = ChatRouteAction
 
 export interface ChatPanelProps {
   userLocation: LatLng | null
+  /** Maps to Flutter onStartDriveway(ChatRoutePlan); web default = plot + fit + ETA card with explicit Start Driveway. */
   onForwardRoute(route: ForwardedRoute): void
   onSelectIssue(id: string): void
 }

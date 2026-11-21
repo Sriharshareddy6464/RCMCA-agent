@@ -4,7 +4,7 @@ AGENT RULES v2 - SEQUENTIAL MODE. Paths relative to web/ (workspace root = 03_la
 2. FROZEN FILES belong to foundation: package.json, package-lock.json, vite/tailwind/ts configs, index.html, src/index.css, src/types/**, src/lib/**, src/theme/**, src/components/ui/**, docs/CONTRACT.md, docs/AGENT_RULES.md, and any file not owned by a track. Never run npm install <pkg>. Need a change? Write docs/requests/<track>.md (what, why, exact proposed change), finish everything else, tell the human.
 3. NO MOCK DATA. Lists, markers, routes, sheets, replies come from the live API.
 4. NO INVENTED STYLE. Colors/radii/spacing/type from theme tokens. Missing token -> request it, never a hardcoded hex.
-5. NO CROSS-TRACK IMPORTS except the frozen layer (types, lib, theme, ui). Only the shell imports track components. chat/report/sheets/map never import each other.
+5. NO CROSS-TRACK IMPORTS except the frozen layer (types, lib, theme, ui). Only the shell imports track components. chat/sheets/map never import each other. Exception: the forms track owns both sheets/ and report/; report/ may import from sheets/ (shared survey-flow components live in sheets/survey/). No other track may import them.
 6. CONTRACTS ARE LAW. Never change a prop signature, file name or export. Replace skeleton bodies only. A Flutter behavior with no prop = a request.
 7. GIT. Stay on the current branch; small commits; never switch/create/delete branches or tags; never rebase, reset or force. Never commit IDE folders (.kiro .agent .codex .opencode .kimi .gemini), .env or dist/.
 8. PROVE IT. Run tsc --noEmit, npm run build, npm run dev and paste real output. If you can view the page, check 1440x900 and 390x844; if you cannot, write "not visually verified". Never claim what you did not see.
